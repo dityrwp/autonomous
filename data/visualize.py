@@ -12,9 +12,6 @@ def visualize_bev_label(bev_label, save_path=None):
                                 - Channel 0: Object Class Labels
                                 - Channel 1: Attribute Labels (e.g., moving/stationary)
         save_path (str): Path to save the visualization (optional).
-
-    Returns:
-        None
     """
     # Extract class labels
     class_mask = bev_label[0]  # First channel (class segmentation)
@@ -40,22 +37,84 @@ def visualize_bev_label(bev_label, save_path=None):
     for class_id, color in class_colors.items():
         bev_visual[class_mask == class_id] = color
 
-    # Plot the BEV segmentation
-    plt.figure(figsize=(6, 6))
-    plt.imshow(bev_visual)
-    plt.title("BEV Segmentation Map")
-    plt.axis("off")
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+
+    # Plot class segmentation
+    ax1.imshow(bev_visual)
+    ax1.set_title("Class Segmentation")
+    ax1.axis("off")
+
+    # Plot attribute segmentation
+    attr_visual = ax2.imshow(attr_mask, cmap='tab10')
+    ax2.set_title("Attribute Segmentation")
+    ax2.axis("off")
+    plt.colorbar(attr_visual, ax=ax2, label='Attribute ID')
+
+    plt.tight_layout()
 
     # Save or show the visualization
     if save_path:
         plt.savefig(save_path)
+        print(f"Saved visualization to {save_path}")
     plt.show()
-# Load one sample
-dataset = NuScenesBEVDataset(dataroot="C:\\nuscenes_mini")
-sample = dataset.get_data_info(0)
 
-# Extract BEV segmentation map
-bev_label = sample['bev_label']  # (2, 128, 128)
+def visualize_point_cloud(points, title="LiDAR Point Cloud"):
+    """
+    Visualize LiDAR point cloud from top-down view.
+    
+    Args:
+        points (np.ndarray): Point cloud array of shape (N, 4) containing x, y, z, intensity
+        title (str): Plot title
+    """
+    plt.figure(figsize=(8, 8))
+    
+    # Create top-down view (x-y plane)
+    plt.scatter(points[:, 0], points[:, 1], 
+               c=points[:, 2],  # Color by height (z)
+               cmap='viridis',
+               s=1)  # Point size
+    
+    plt.title(title)
+    plt.xlabel('X (m)')
+    plt.ylabel('Y (m)')
+    plt.axis('equal')
+    plt.colorbar(label='Height (m)')
+    plt.show()
 
-# Visualize the BEV segmentation
-visualize_bev_label(bev_label, save_path="bev_debug.png")
+def test_dataset_preprocessing():
+    """Test the NuScenes dataset preprocessing pipeline."""
+    try:
+        # Initialize dataset
+        dataset = NuScenesBEVDataset(
+            dataroot="C:\\nuscenes_mini",
+            split='train',
+            sample_ratio=1.0
+        )
+        
+        print(f"Dataset initialized with {len(dataset.samples)} samples")
+        
+        # Test data loading for first sample
+        sample_idx = 0
+        print(f"\nProcessing sample {sample_idx}...")
+        
+        # Get raw data
+        sample_data = dataset.get_data_info(sample_idx)
+        
+        # Visualize point cloud
+        points = sample_data['lidar_points']
+        print(f"Point cloud shape: {points.shape}")
+        visualize_point_cloud(points)
+        
+        # Visualize BEV segmentation
+        bev_label = sample_data['bev_label']
+        print(f"BEV label shape: {bev_label.shape}")
+        visualize_bev_label(bev_label, save_path="bev_debug.png")
+        
+    except Exception as e:
+        print(f"Error occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    test_dataset_preprocessing()
