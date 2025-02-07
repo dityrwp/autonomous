@@ -1,61 +1,185 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
+from nuscenes.nuscenes import NuScenes
+import os
 from nuscenes_dataset import NuScenesBEVDataset
 
-def visualize_bev_label(bev_label, save_path=None):
+def visualize_bev_and_image(dataset, sample_idx, save_path=None):
     """
-    Visualizes BEV segmentation labels.
-
-    Args:
-        bev_label (np.ndarray): BEV segmentation map, shape (2, 128, 128)
-                                - Channel 0: Object Class Labels
-                                - Channel 1: Attribute Labels (e.g., moving/stationary)
-        save_path (str): Path to save the visualization (optional).
+    Visualizes rear-cropped BEV segmentation labels alongside the front camera image.
+    The BEV shows a 50m x 50m area behind the vehicle, with the ego vehicle at the bottom.
     """
-    # Extract class labels
-    class_mask = bev_label[0]  # First channel (class segmentation)
-    attr_mask = bev_label[1]   # Second channel (attribute segmentation, optional)
+    sample = dataset.samples[sample_idx]
+    
+    # Get front camera image
+    cam_token = sample['data'][dataset.front_cam]
+    cam_data = dataset.nusc.get('sample_data', cam_token)
+    img_path = os.path.join(dataset.dataroot, cam_data['filename'])
+    img = cv2.imread(img_path)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    # Get BEV segmentation
+    data_info = dataset.get_data_info(sample_idx)
+    bev_label = data_info['bev_label']
+    
+    # Extract labels
+    semantic_mask = bev_label[0]  # Semantic segmentation
+    instance_mask = bev_label[1]  # Instance segmentation
+    map_mask = bev_label[2]      # Map layers
 
-    # Define colors for different object classes
-    class_colors = {
-        0: (0, 0, 0),       # Background - Black
-        1: (255, 0, 0),     # Car - Red
-        2: (0, 255, 0),     # Truck - Green
-        3: (0, 0, 255),     # Trailer - Blue
-        4: (255, 255, 0),   # Bus - Yellow
-        5: (255, 0, 255),   # Construction Vehicle - Magenta
-        6: (0, 255, 255),   # Bicycle - Cyan
-        7: (128, 128, 128), # Motorcycle - Gray
-        8: (255, 165, 0),   # Pedestrian - Orange
-        9: (0, 128, 255),   # Traffic Cone - Light Blue
-        10: (128, 0, 128)   # Barrier - Purple
+    # Define colors with better visibility
+    semantic_colors = {
+        0: (40, 40, 40),       # Background - Dark Gray
+        1: (255, 100, 100),    # Car - Brighter Red
+        2: (107, 142, 35),     # Truck - Olive Green
+        3: (100, 149, 237),    # Trailer - Cornflower Blue
+        4: (255, 191, 0),      # Bus - Amber
+        5: (222, 111, 161),    # Construction Vehicle
+        6: (95, 158, 160),     # Bicycle
+        7: (189, 183, 107),    # Motorcycle
+        8: (255, 127, 80),     # Pedestrian - Coral
+        9: (86, 180, 233),     # Traffic Cone
+        10: (153, 108, 166),   # Barrier
+        11: (176, 224, 230)    # Drivable Area - Light Blue
     }
 
-    # Convert class mask to RGB image
-    bev_visual = np.zeros((class_mask.shape[0], class_mask.shape[1], 3), dtype=np.uint8)
-    for class_id, color in class_colors.items():
-        bev_visual[class_mask == class_id] = color
+    # Define map layer colors with better visibility
+    map_colors = {
+        1: (176, 224, 230),    # Drivable Area - Light Blue
+        2: (152, 251, 152),    # Road Segment - Pale Green
+        3: (255, 182, 193),    # Road Block - Light Pink
+        4: (255, 215, 0),      # Lane - Gold
+        5: (255, 0, 0),        # Road Divider - Red
+        6: (255, 255, 0)       # Lane Divider - Yellow
+    }
 
-    # Create figure with two subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+    # Define class names mapping
+    class_names = {
+        0: 'background',
+        1: 'car (ego)',
+        2: 'truck', 
+        3: 'trailer',
+        4: 'bus',
+        5: 'construction_vehicle',
+        6: 'bicycle',
+        7: 'motorcycle',
+        8: 'pedestrian',
+        9: 'traffic_cone',
+        10: 'barrier',
+        11: 'drivable_area'
+    }
 
-    # Plot class segmentation
-    ax1.imshow(bev_visual)
-    ax1.set_title("Class Segmentation")
+    # Define map layer names
+    map_names = {
+        1: 'drivable_area',
+        2: 'road_segment',
+        3: 'road_block',
+        4: 'lane',
+        5: 'road_divider',
+        6: 'lane_divider'
+    }
+
+    # Create figure with subplots
+    fig = plt.figure(figsize=(24, 16))
+    
+    # Plot front camera image
+    ax1 = plt.subplot(221)
+    ax1.imshow(img)
+    ax1.set_title("Front Camera View", fontsize=14)
     ax1.axis("off")
 
-    # Plot attribute segmentation
-    attr_visual = ax2.imshow(attr_mask, cmap='tab10')
-    ax2.set_title("Attribute Segmentation")
+    # Plot semantic segmentation
+    ax2 = plt.subplot(222)
+    semantic_visual = np.zeros((semantic_mask.shape[0], semantic_mask.shape[1], 3), dtype=np.uint8)
+    for class_id, color in semantic_colors.items():
+        semantic_visual[semantic_mask == class_id] = color
+    ax2.imshow(semantic_visual)
+    ax2.set_title("Semantic Segmentation", fontsize=14)
     ax2.axis("off")
-    plt.colorbar(attr_visual, ax=ax2, label='Attribute ID')
+
+    # Plot instance segmentation with random colors
+    ax3 = plt.subplot(223)
+    instance_visual = np.zeros((instance_mask.shape[0], instance_mask.shape[1], 3), dtype=np.uint8)
+    unique_instances = np.unique(instance_mask)[1:]  # Skip background
+    for instance_id in unique_instances:
+        color = np.random.randint(0, 255, 3)
+        instance_visual[instance_mask == instance_id] = color
+    ax3.imshow(instance_visual)
+    ax3.set_title("Instance Segmentation", fontsize=14)
+    ax3.axis("off")
+
+    # Plot map layers with alpha blending
+    ax4 = plt.subplot(224)
+    map_visual = np.zeros((map_mask.shape[0], map_mask.shape[1], 4), dtype=np.float32)  # RGBA
+    
+    # Add layers in order (bottom to top)
+    layer_order = [1, 2, 4, 5, 6]  # drivable_area, road_segment, lane, road_divider, lane_divider
+    for layer_id in layer_order:
+        mask = map_mask == layer_id
+        if mask.any():  # Only process if layer exists
+            color = np.array(map_colors[layer_id]) / 255.0
+            alpha = 0.7 if layer_id <= 4 else 0.9  # Higher alpha for dividers
+            
+            # Create RGBA color
+            rgba = np.array([*color, alpha])
+            
+            # Update pixels where mask is True
+            map_visual[mask] = rgba
+
+    # Set background to black
+    map_visual[np.all(map_visual == 0, axis=-1)] = [0, 0, 0, 1]
+
+    ax4.imshow(map_visual)
+    ax4.set_title("Map Layers", fontsize=14)
+    ax4.axis("off")
+
+    # Add grid and distance markers
+    for ax in [ax2, ax3, ax4]:
+        ax.grid(True, linestyle='--', alpha=0.3)
+        distances = [10, 20, 30, 40]  # meters
+        pixels_per_meter = semantic_visual.shape[0] / 50  # 50m total range
+        for dist in distances:
+            y_pos = semantic_visual.shape[0] - dist * pixels_per_meter
+            ax.axhline(y=y_pos, color='white', linestyle='--', alpha=0.3)
+            ax.text(5, y_pos-5, f'{dist}m', color='white', alpha=0.7, fontsize=10)
+
+    # Add legends
+    # Semantic legend
+    semantic_legend = [
+        plt.Rectangle((0,0), 1, 1, 
+                     facecolor=np.array(color)/255,
+                     label=class_names[class_id])
+        for class_id, color in semantic_colors.items()
+        if class_id in np.unique(semantic_mask)
+    ]
+    ax2.legend(handles=semantic_legend, 
+              loc='center left', 
+              bbox_to_anchor=(1, 0.5),
+              title='Classes',
+              fontsize=8,
+              title_fontsize=10)
+
+    # Map layers legend
+    map_legend = [
+        plt.Rectangle((0,0), 1, 1,
+                     facecolor=np.array(map_colors[layer_id])/255,
+                     alpha=0.7 if layer_id <= 4 else 0.9,
+                     label=map_names[layer_id])
+        for layer_id in layer_order
+        if layer_id in np.unique(map_mask)
+    ]
+    ax4.legend(handles=map_legend,
+              loc='center left',
+              bbox_to_anchor=(1, 0.5),
+              title='Map Layers',
+              fontsize=8,
+              title_fontsize=10)
 
     plt.tight_layout()
-
-    # Save or show the visualization
+    
     if save_path:
-        plt.savefig(save_path)
+        plt.savefig(save_path, bbox_inches='tight', dpi=300, facecolor='black')
         print(f"Saved visualization to {save_path}")
     plt.show()
 
@@ -71,6 +195,7 @@ def visualize_point_cloud(points, title="LiDAR Point Cloud"):
     
     # Create top-down view (x-y plane)
     plt.scatter(points[:, 0], points[:, 1], 
+                
                c=points[:, 2],  # Color by height (z)
                cmap='viridis',
                s=1)  # Point size
@@ -94,22 +219,19 @@ def test_dataset_preprocessing():
         
         print(f"Dataset initialized with {len(dataset.samples)} samples")
         
-        # Test data loading for first sample
-        sample_idx = 0
-        print(f"\nProcessing sample {sample_idx}...")
-        
-        # Get raw data
-        sample_data = dataset.get_data_info(sample_idx)
-        
-        # Visualize point cloud
-        points = sample_data['lidar_points']
-        print(f"Point cloud shape: {points.shape}")
-        visualize_point_cloud(points)
-        
-        # Visualize BEV segmentation
-        bev_label = sample_data['bev_label']
-        print(f"BEV label shape: {bev_label.shape}")
-        visualize_bev_label(bev_label, save_path="bev_debug.png")
+        # Test multiple samples
+        for sample_idx in range(min(5, len(dataset.samples))):
+            print(f"\nProcessing sample {sample_idx}...")
+            
+            # Visualize BEV and front camera image
+            visualize_bev_and_image(
+                dataset, 
+                sample_idx, 
+                save_path=f"bev_visualization_{sample_idx}.png"
+            )
+            
+            # Optional: wait for user input before showing next sample
+            input("Press Enter to continue to next sample...")
         
     except Exception as e:
         print(f"Error occurred: {str(e)}")
