@@ -1,0 +1,59 @@
+# Model Configuration
+
+# Backbone Configurations
+camera_backbone:
+  name: "EfficientNetV2Backbone"
+  pretrained: true
+  out_channels:
+    stage1: 32
+    stage2: 64
+    stage3: 128
+    stage4: 256
+    stage5: 512
+
+lidar_backbone:
+  name: "SECONDBackbone"
+  voxel_size: [0.8, 0.8, 0.8]
+  point_cloud_range: [-51.2, -51.2, -5, 51.2, 51.2, 3]
+  max_num_points: 32
+  max_voxels: 4000
+
+# Fusion Configuration
+fusion:
+  name: "BEVFusion"
+  lidar_channels: 128
+  image_channels:
+    stage3: 256
+    stage4: 384
+    stage5: 512
+  output_channels: 128
+  bev_height: 128
+  bev_width: 128
+  num_heads: 4
+
+# Segmentation Head Configuration
+segmentation_head:
+  name: "BEVSegmentationHead"
+  in_channels: 128
+  hidden_channels: 128
+  num_classes: 3
+  dropout: 0.1
+  use_focal_loss: true
+  focal_gamma: 2.0
+  learnable_alpha: true
+  initial_alpha: 0.25
+
+# Data Configuration
+input_config:
+  image_size: [384, 512]  # H, W
+  num_cameras: 1
+  num_lidar_channels: 16  # Velodyne Puck
+  max_points_per_frame: 25000
+
+# Augmentation Configuration
+augmentation:
+  random_flip: true
+  random_rotate: true
+  rotate_range: [-0.78539816, 0.78539816]  # [-pi/4, pi/4]
+  scale_range: [0.95, 1.05]
+  translation_std: [0.2, 0.2, 0.2]

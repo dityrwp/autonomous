@@ -1,0 +1,84 @@
+# Training Configuration
+
+# Basic Training Settings
+train:
+  epochs: 100
+  batch_size: 4
+  num_workers: 4
+  pin_memory: true
+  mixed_precision: true  # Use AMP
+  sync_bn: true  # Use SyncBatchNorm for multi-GPU
+  deterministic: true  # For reproducibility
+  seed: 42
+
+# Optimization
+optimizer:
+  name: "AdamW"
+  lr_camera: 1.0e-4
+  lr_lidar: 1.0e-4
+  lr_fusion: 1.0e-4
+  lr_head: 1.0e-4
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-8
+
+# Learning Rate Scheduler
+scheduler:
+  name: "CosineAnnealingLR"
+  T_max: 100  # Same as epochs
+  eta_min: 1.0e-6
+  warmup_epochs: 5
+  warmup_ratio: 0.1
+
+# Loss Configuration
+loss:
+  focal_loss:
+    gamma: 2.0
+    alpha: 0.25
+  class_weights: [1.0, 1.0, 1.0]  # Weight for each class
+  loss_weights:
+    segmentation: 1.0
+
+# Validation
+val:
+  interval: 1  # Validate every N epochs
+  batch_size: 4
+  save_predictions: true
+  visualization_threshold: 0.5
+
+# Checkpointing
+checkpoint:
+  save_dir: "checkpoints"
+  save_interval: 10  # Save every N epochs
+  save_best: true
+  save_last: true
+  resume: false
+  resume_path: null
+
+# Logging
+logging:
+  log_dir: "logs"
+  log_interval: 10  # Log every N steps
+  metrics:
+    - "loss"
+    - "mean_iou"
+    - "class_iou"
+    - "precision"
+    - "recall"
+  visualization:
+    save_dir: "visualizations"
+    max_images: 16  # Max number of images to save per epoch
+
+# Hardware
+hardware:
+  gpu_ids: [0]  # List of GPU ids to use
+  dist_backend: "nccl"
+  dist_url: "tcp://localhost:12345"
+
+# Debug
+debug:
+  enabled: false
+  subset_size: 100  # Number of samples to use in debug mode
+  profile: false  # Enable profiling
+  check_nan: true  # Check for NaN values
