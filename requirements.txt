@@ -1,24 +1,21 @@
-# Core dependencies
+# Core ML
+torch==2.1.0
+torchvision==0.16.0
+numpy==1.24.3
+tensorboard==2.14.1
 
-opencv-python==4.5.5.64
-matplotlib==3.5.3
-pyyaml==5.4.1
-tqdm==4.62.3
-scipy==1.7.3
-scikit-image==0.18.3
-scikit-learn==0.24.2
-Pillow==8.4.0
-tensorboard==2.6.0
+# Dataset & Processing
+nuscenes-devkit==1.1.11
 pyquaternion==0.9.9
-termcolor==1.1.0
-numba==0.53.1
-timm==0.6.7
+shapely==2.0.2
+scikit-image==0.22.0
+opencv-python==4.8.1.78
+pillow==10.1.0
 
-# Machine Learning & Deep Learning (Updated for CUDA 12.3)
-# torch==2.1.2+cu121  # PyTorch with CUDA 12.1 (Compatible with CUDA 12.3)
-# torchvision==0.16.2+cu121
-# torchaudio==2.1.2
-#cudatoolkit>=10.1
-# mmcv==2.1.0
-# mmdet==3.3.0
-#nuscenes-devkit
+# Utilities
+PyYAML==6.0.1
+tqdm==4.66.1
+matplotlib==3.8.2
+
+# Performance (optional)
+numba==0.58.1
