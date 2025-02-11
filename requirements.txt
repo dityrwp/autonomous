@@ -1,21 +1,20 @@
-# Core ML
-torch==2.1.0
-torchvision==0.16.0
-numpy==1.24.3
-tensorboard==2.14.1
+# Core dependencies
+torch==2.4.1+cu118
+torchvision==0.19.1
+numpy==1.22.4
+PyYAML==6.0.2
+tensorboard==2.6.0
 
-# Dataset & Processing
+# nuScenes dataset
 nuscenes-devkit==1.1.11
 pyquaternion==0.9.9
-shapely==2.0.2
-scikit-image==0.22.0
-opencv-python==4.8.1.78
-pillow==10.1.0
+shapely==1.8.5.post1
+scikit-image==0.18.3
+opencv-python==4.5.5.64
 
-# Utilities
-PyYAML==6.0.1
-tqdm==4.66.1
-matplotlib==3.8.2
+# Utilities and logging
+tqdm==4.65.2
+matplotlib==3.5.3
 
-# Performance (optional)
-numba==0.58.1
+# Optional but recommended for performance
+numba==0.53.1
