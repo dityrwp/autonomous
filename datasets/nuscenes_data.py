@@ -43,18 +43,84 @@ class NuScenesFilteredDataset(Dataset):
         """Finds samples that contain both front camera and LiDAR frames."""
         scenes = create_splits_scenes()[self.split]
         samples = []
+        scene_count = 0
+        missing_files = []
         
+        # First, check which scenes are actually available in the dataset
+        available_scenes = set()
         for scene in self.nusc.scene:
             if scene['name'] not in scenes:
                 continue
                 
+            first_sample = self.nusc.get('sample', scene['first_sample_token'])
+            try:
+                # Try to access the camera file to verify scene availability
+                cam_data = self.nusc.get('sample_data', first_sample['data'][self.cam_sensor])
+                cam_path = os.path.join(self.dataroot, cam_data['filename'].replace('/', os.sep))
+                if os.path.exists(cam_path):
+                    available_scenes.add(scene['name'])
+                    logging.debug(f"Scene {scene['name']} is available")
+                else:
+                    logging.debug(f"Scene {scene['name']} camera file not found: {cam_path}")
+            except Exception as e:
+                logging.debug(f"Scene {scene['name']} not available: {str(e)}")
+                continue
+        
+        logging.info(f"Found {len(available_scenes)} available scenes out of {len(scenes)} total scenes")
+        
+        # Then filter samples only from available scenes
+        for scene in self.nusc.scene:
+            if scene['name'] not in scenes or scene['name'] not in available_scenes:
+                continue
+                
+            scene_count += 1
             sample_token = scene['first_sample_token']
+            scene_samples = 0
+            
             while sample_token:
                 sample = self.nusc.get('sample', sample_token)
-                if self._has_valid_sensors(sample):
-                    samples.append(sample_token)
-                sample_token = sample['next']
                 
+                # Check if files exist before adding to samples
+                try:
+                    cam_data = self.nusc.get('sample_data', sample['data'][self.cam_sensor])
+                    lidar_data = self.nusc.get('sample_data', sample['data'][self.lidar_sensor])
+                    
+                    cam_path = os.path.join(self.dataroot, cam_data['filename'].replace('/', os.sep))
+                    lidar_path = os.path.join(self.dataroot, lidar_data['filename'].replace('/', os.sep))
+                    
+                    if not os.path.exists(cam_path):
+                        missing_files.append(cam_path)
+                        sample_token = sample['next']
+                        continue
+                        
+                    if not os.path.exists(lidar_path):
+                        missing_files.append(lidar_path)
+                        sample_token = sample['next']
+                        continue
+                    
+                    if self._has_valid_sensors(sample):
+                        samples.append(sample_token)
+                        scene_samples += 1
+                except Exception as e:
+                    logging.warning(f"Error processing sample {sample_token}: {str(e)}")
+                    
+                sample_token = sample['next']
+            
+            logging.debug(f"Scene {scene['name']}: found {scene_samples} valid samples")
+        
+        if missing_files:
+            logging.warning(f"Found {len(missing_files)} missing files. First 5:")
+            for f in missing_files[:5]:
+                logging.warning(f"  {f}")
+        
+        logging.info(f"Found {len(samples)} samples from {scene_count} scenes")
+        if len(samples) == 0:
+            raise RuntimeError(
+                "No valid samples found! Please check:\n"
+                "1. Dataset structure and scene availability\n"
+                "2. File naming conventions\n"
+                "3. Dataset extraction completeness"
+            )
         return samples
 
     def _has_valid_sensors(self, sample):
@@ -81,11 +147,64 @@ class NuScenesFilteredDataset(Dataset):
         try:
             # Load camera data
             cam_data = self.nusc.get('sample_data', sample['data'][self.cam_sensor])
-            cam_path = os.path.join(self.dataroot, cam_data['filename'])
+            cam_filename = cam_data['filename'].replace('/', os.sep)
+            cam_path = os.path.join(self.dataroot, cam_filename)
             
             # Load LiDAR data
             lidar_data = self.nusc.get('sample_data', sample['data'][self.lidar_sensor])
-            lidar_path = os.path.join(self.dataroot, lidar_data['filename'])
+            lidar_filename = lidar_data['filename'].replace('/', os.sep)
+            lidar_path = os.path.join(self.dataroot, lidar_filename)
+            
+            # Debug logging for paths
+            logging.debug(f"\nProcessing sample {sample_token}:")
+            logging.debug(f"Camera filename from dataset: {cam_data['filename']}")
+            logging.debug(f"Constructed camera path: {cam_path}")
+            logging.debug(f"LiDAR filename from dataset: {lidar_data['filename']}")
+            logging.debug(f"Constructed LiDAR path: {lidar_path}")
+            
+            # Verify camera directory exists
+            cam_dir = os.path.dirname(cam_path)
+            if not os.path.exists(cam_dir):
+                raise FileNotFoundError(
+                    f"Camera directory not found: {cam_dir}\n"
+                    f"Please check dataset structure."
+                )
+            
+            # List available files in camera directory for debugging
+            if not os.path.exists(cam_path):
+                cam_files = os.listdir(cam_dir)
+                logging.debug(f"\nAvailable files in {cam_dir}:")
+                for f in sorted(cam_files)[:5]:  # Show first 5 files
+                    logging.debug(f"  {f}")
+                raise FileNotFoundError(
+                    f"Image not found: {cam_path}\n"
+                    f"Original filename: {cam_data['filename']}\n"
+                    f"Dataroot: {self.dataroot}\n"
+                    f"Camera directory exists but file not found.\n"
+                    f"Please check file naming and dataset extraction."
+                )
+            
+            # Verify LiDAR directory exists
+            lidar_dir = os.path.dirname(lidar_path)
+            if not os.path.exists(lidar_dir):
+                raise FileNotFoundError(
+                    f"LiDAR directory not found: {lidar_dir}\n"
+                    f"Please check dataset structure."
+                )
+            
+            # List available files in LiDAR directory for debugging
+            if not os.path.exists(lidar_path):
+                lidar_files = os.listdir(lidar_dir)
+                logging.debug(f"\nAvailable files in {lidar_dir}:")
+                for f in sorted(lidar_files)[:5]:  # Show first 5 files
+                    logging.debug(f"  {f}")
+                raise FileNotFoundError(
+                    f"LiDAR data not found: {lidar_path}\n"
+                    f"Original filename: {lidar_data['filename']}\n"
+                    f"Dataroot: {self.dataroot}\n"
+                    f"LiDAR directory exists but file not found.\n"
+                    f"Please check file naming and dataset extraction."
+                )
             
             # Load calibration data
             calib = self._load_calibration(sample)
@@ -159,34 +278,62 @@ class NuScenesBEVLabelDataset(Dataset):
                            'singapore-queenstown', 'boston-seaport']
             
             for location in map_locations:
-                map_path = os.path.join(self.nusc.dataroot, 'maps', 
-                                      'expansion', f'{location}.json')
-                if os.path.exists(map_path):
-                    self.map_cache[location] = NuScenesMap(self.nusc.dataroot, location)
+                # Check expansion (json) maps
+                json_map_path = os.path.join(self.nusc.dataroot, 'maps', 
+                                           'expansion', f'{location}.json')
+                # Check basemap (png) maps
+                png_map_path = os.path.join(self.nusc.dataroot, 'maps',
+                                          'basemap', f'{location}.png')
+                
+                if os.path.exists(json_map_path) and os.path.exists(png_map_path):
+                    self.map_cache[location] = NuScenesMap(
+                        dataroot=self.nusc.dataroot,
+                        map_name=location
+                    )
                     logging.info(f"Loaded map for location: {location}")
                 else:
-                    raise FileNotFoundError(f"Map file not found: {map_path}")
+                    missing = []
+                    if not os.path.exists(json_map_path):
+                        missing.append(f"JSON map: {json_map_path}")
+                    if not os.path.exists(png_map_path):
+                        missing.append(f"PNG map: {png_map_path}")
+                    raise FileNotFoundError(
+                        f"Missing map files for {location}:\n" + 
+                        "\n".join(missing)
+                    )
             
         except Exception as e:
             raise RuntimeError(f"Error initializing maps: {e}")
 
     def _validate_samples(self):
         """Validate all samples and filter those with proper map data."""
+        # Remove part-specific sample count check
+        valid_samples_by_location = {}
+        
         for idx in range(len(self.filtered_dataset)):
             sample = self.filtered_dataset[idx]
             sample_token = sample['sample_token']
             
-            # Get scene and location
+            # Get scene and log for location
             scene = self.nusc.get('sample', sample_token)['scene_token']
             scene = self.nusc.get('scene', scene)
-            location = scene['location']
+            log = self.nusc.get('log', scene['log_token'])
+            location = log['location']
             
             # Check if we have valid map data
             if location in self.map_cache:
                 self.valid_samples.append(idx)
-            
+                valid_samples_by_location[location] = valid_samples_by_location.get(location, 0) + 1
+            else:
+                logging.debug(f"No map data for location: {location}")
+        
         if not self.valid_samples:
             raise RuntimeError("No valid samples found with map data!")
+        
+        # Log distribution of samples across locations
+        logging.info("Sample distribution across locations:")
+        for location, count in valid_samples_by_location.items():
+            logging.info(f"  {location}: {count} samples")
         
         logging.info(f"Found {len(self.valid_samples)} valid samples out of "
                     f"{len(self.filtered_dataset)} total samples")
@@ -218,10 +365,11 @@ class NuScenesBEVLabelDataset(Dataset):
         """Generates a BEV grid with HD map elements."""
         label = np.zeros((self.grid_size, self.grid_size), dtype=np.uint8)
         
-        # Get scene and location
-        scene = self.nusc.get('sample', sample_token)['scene_token']
-        scene = self.nusc.get('scene', scene)
-        location = scene['location']
+        # Get scene and log for location
+        sample = self.nusc.get('sample', sample_token)
+        scene = self.nusc.get('scene', sample['scene_token'])
+        log = self.nusc.get('log', scene['log_token'])
+        location = log['location']
         
         # Get map (should be cached)
         nusc_map = self.map_cache.get(location)
