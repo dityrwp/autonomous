@@ -9,9 +9,17 @@ from nuscenes.map_expansion.map_api import NuScenesMap
 from pyquaternion import Quaternion
 import logging
 from shapely.geometry import Polygon, LineString
+import json
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+def patched_load_table(self, table_name):
+    filepath = os.path.join(self.dataroot, self.version, table_name + '.json')
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+NuScenes.__load_table__ = patched_load_table
 
 class NuScenesFilteredDataset(Dataset):
     """Filters nuScenes samples to only include frames with both front camera and LiDAR."""
@@ -272,70 +280,132 @@ class NuScenesBEVLabelDataset(Dataset):
 
     def _initialize_maps(self):
         """Initialize and cache maps for all locations."""
-        try:
-            # For trainval dataset, use location-based maps
-            map_locations = ['singapore-onenorth', 'singapore-hollandvillage', 
-                           'singapore-queenstown', 'boston-seaport']
-            
-            for location in map_locations:
-                # Check expansion (json) maps
-                json_map_path = os.path.join(self.nusc.dataroot, 'maps', 
-                                           'expansion', f'{location}.json')
-                # Check basemap (png) maps
-                png_map_path = os.path.join(self.nusc.dataroot, 'maps',
-                                          'basemap', f'{location}.png')
+        map_locations = ['singapore-onenorth', 'singapore-hollandvillage', 
+                        'singapore-queenstown', 'boston-seaport']
+        
+        for location in map_locations:
+            try:
+                # Check map files exist
+                json_path = os.path.join(self.nusc.dataroot, 'maps', 'expansion', f'{location}.json')
                 
-                if os.path.exists(json_map_path) and os.path.exists(png_map_path):
-                    self.map_cache[location] = NuScenesMap(
-                        dataroot=self.nusc.dataroot,
-                        map_name=location
-                    )
-                    logging.info(f"Loaded map for location: {location}")
-                else:
-                    missing = []
-                    if not os.path.exists(json_map_path):
-                        missing.append(f"JSON map: {json_map_path}")
-                    if not os.path.exists(png_map_path):
-                        missing.append(f"PNG map: {png_map_path}")
-                    raise FileNotFoundError(
-                        f"Missing map files for {location}:\n" + 
-                        "\n".join(missing)
-                    )
-            
-        except Exception as e:
-            raise RuntimeError(f"Error initializing maps: {e}")
+                if not os.path.exists(json_path):
+                    logging.error(f"Map files missing for {location}")
+                    continue
+                
+                # Load map
+                nusc_map = NuScenesMap(dataroot=self.nusc.dataroot, map_name=location)
+                self.map_cache[location] = nusc_map
+                logging.info(f"Loaded map for {location}")
+                
+            except Exception as e:
+                logging.error(f"Failed to load map for {location}: {str(e)}")
+                continue
+        
+        if not self.map_cache:
+            raise RuntimeError(
+                "No maps loaded! Please check:\n"
+                "1. Map files exist and are readable\n"
+                f"2. Dataset root path is correct: {self.nusc.dataroot}"
+            )
 
     def _validate_samples(self):
         """Validate all samples and filter those with proper map data."""
-        # Remove part-specific sample count check
         valid_samples_by_location = {}
+        location_counts = {}  # Track all locations
         
         for idx in range(len(self.filtered_dataset)):
-            sample = self.filtered_dataset[idx]
-            sample_token = sample['sample_token']
-            
-            # Get scene and log for location
-            scene = self.nusc.get('sample', sample_token)['scene_token']
-            scene = self.nusc.get('scene', scene)
-            log = self.nusc.get('log', scene['log_token'])
-            location = log['location']
-            
-            # Check if we have valid map data
-            if location in self.map_cache:
-                self.valid_samples.append(idx)
-                valid_samples_by_location[location] = valid_samples_by_location.get(location, 0) + 1
-            else:
-                logging.debug(f"No map data for location: {location}")
+            try:
+                sample = self.filtered_dataset[idx]
+                sample_token = sample['sample_token']
+                
+                # Get scene and log for location
+                scene_token = self.nusc.get('sample', sample_token)['scene_token']
+                scene = self.nusc.get('scene', scene_token)
+                log = self.nusc.get('log', scene['log_token'])
+                location = log['location']
+                
+                # Track all locations
+                location_counts[location] = location_counts.get(location, 0) + 1
+                
+                if location in self.map_cache:
+                    nusc_map = self.map_cache[location]
+                    ego_pose = sample['ego_pose']
+                    ego_x, ego_y = ego_pose['translation'][:2]
+                    
+                    # Define patch box around ego vehicle (x_min, y_min, x_max, y_max)
+                    patch_size = self.grid_size * self.resolution  # Convert grid cells to meters
+                    patch_box = (
+                        ego_x - patch_size/2,  # x_min
+                        ego_y - patch_size/2,  # y_min
+                        ego_x + patch_size/2,  # x_max
+                        ego_y + patch_size/2   # y_max
+                    )
+                    
+                    # Check for any map data in the patch
+                    found_data = False
+                    for layer in ['drivable_area', 'road_segment', 'lane']:
+                        try:
+                            records = nusc_map.get_records_in_patch(patch_box, layer_names=[layer])
+                            if records and len(records[layer]) > 0:
+                                # Verify we can extract at least one polygon
+                                record = nusc_map.get(layer, records[layer][0])
+                                if layer == 'drivable_area':
+                                    poly_token = record['polygon_tokens'][0]
+                                else:
+                                    poly_token = record['polygon_token']
+                                
+                                poly = nusc_map.extract_polygon(poly_token)
+                                if not poly.is_empty:
+                                    found_data = True
+                                    break
+                        except Exception as e:
+                            logging.debug(f"Error checking {layer} at {location}: {str(e)}")
+                            continue
+                    
+                    if found_data:
+                        self.valid_samples.append(idx)
+                        valid_samples_by_location[location] = valid_samples_by_location.get(location, 0) + 1
+                        
+                else:
+                    logging.debug(f"No map cache for location: {location}")
+                    
+            except Exception as e:
+                logging.warning(f"Error validating sample {idx}: {str(e)}")
+                continue
+        
+        # Log statistics
+        total_samples = len(self.filtered_dataset)
+        valid_samples = len(self.valid_samples)
+        logging.info(f"\nDataset Statistics:")
+        logging.info(f"Total samples: {total_samples}")
+        logging.info(f"Valid samples: {valid_samples} ({valid_samples/total_samples*100:.1f}%)")
+        logging.info("\nSamples by location:")
+        for loc in location_counts:
+            valid = valid_samples_by_location.get(loc, 0)
+            total = location_counts[loc]
+            logging.info(f"{loc}: {valid}/{total} valid ({valid/total*100:.1f}%)")
         
         if not self.valid_samples:
-            raise RuntimeError("No valid samples found with map data!")
+            # Provide detailed error message
+            logging.error("\nMap loading summary:")
+            logging.error(f"Total locations in dataset: {len(location_counts)}")
+            logging.error(f"Successfully loaded maps: {len(self.map_cache)}")
+            logging.error("\nAvailable locations:")
+            for location in location_counts:
+                logging.error(f"  {location}")
+            logging.error("\nLoaded maps:")
+            for location in self.map_cache:
+                logging.error(f"  {location}")
+            
+            raise RuntimeError(
+                "No valid samples found with map data! Please check:\n"
+                "1. Map files exist in the correct location\n"
+                "2. Map files contain valid data\n"
+                "3. Sample locations match available maps\n"
+                f"4. Dataset root path is correct: {self.nusc.dataroot}"
+            )
         
-        # Log distribution of samples across locations
-        logging.info("Sample distribution across locations:")
-        for location, count in valid_samples_by_location.items():
-            logging.info(f"  {location}: {count} samples")
-        
-        logging.info(f"Found {len(self.valid_samples)} valid samples out of "
+        logging.info(f"\nFound {len(self.valid_samples)} valid samples out of "
                     f"{len(self.filtered_dataset)} total samples")
 
     def __len__(self):
@@ -362,59 +432,95 @@ class NuScenesBEVLabelDataset(Dataset):
             raise
 
     def _generate_bev_label(self, sample_token, ego_pose):
-        """Generates a BEV grid with HD map elements."""
+        """Generate BEV segmentation label."""
         label = np.zeros((self.grid_size, self.grid_size), dtype=np.uint8)
         
-        # Get scene and log for location
+        # Get scene location
         sample = self.nusc.get('sample', sample_token)
         scene = self.nusc.get('scene', sample['scene_token'])
         log = self.nusc.get('log', scene['log_token'])
         location = log['location']
         
-        # Get map (should be cached)
+        logging.info(f"\nGenerating BEV label for sample {sample_token}")
+        logging.info(f"Location: {location}")
+        
         nusc_map = self.map_cache.get(location)
         if nusc_map is None:
             raise RuntimeError(f"Map not found for location: {location}")
         
-        try:
-            # Get patch coordinates centered around ego pose
-            patch_box = (ego_pose['translation'][0], ego_pose['translation'][1],
-                        self.grid_size * self.resolution, self.grid_size * self.resolution)
-            patch_angle = Quaternion(ego_pose['rotation']).yaw_pitch_roll[0]
-            
-            # Process each map layer
-            for layer_name, class_id in self.class_map.items():
-                try:
-                    # Get records in the patch
-                    records = nusc_map.get_records_in_patch(patch_box, layer_names=[layer_name], mode='intersect')
-                    
-                    # Get geometries for the records
-                    geometries = []
-                    for token in records[layer_name]:
-                        if layer_name in ['road_divider', 'lane_divider']:
-                            line = nusc_map.get('line', token)
-                            geom = {'polygon': nusc_map.extract_line(line['line_token'])}
+        # Calculate patch box
+        patch_size = self.grid_size * self.resolution
+        ego_x, ego_y = ego_pose['translation'][:2]
+        patch_box = (
+            ego_x - patch_size/2,
+            ego_y - patch_size/2,
+            ego_x + patch_size/2,
+            ego_y + patch_size/2
+        )
+        
+        logging.info(f"Ego position: ({ego_x:.2f}, {ego_y:.2f})")
+        logging.info(f"Patch box: {patch_box}")
+        
+        # Process each map layer
+        for layer_name, class_id in self.class_map.items():
+            try:
+                # Get records in patch
+                records = nusc_map.get_records_in_patch(patch_box, layer_names=[layer_name])
+                layer_records = records.get(layer_name, [])
+                
+                logging.info(f"\nProcessing layer {layer_name}: found {len(layer_records)} records")
+                
+                for record_token in layer_records:
+                    try:
+                        record = nusc_map.get(layer_name, record_token)
+                        
+                        if layer_name == 'drivable_area':
+                            # Handle multiple polygons for drivable area
+                            for poly_token in record['polygon_tokens']:
+                                polygon = nusc_map.extract_polygon(poly_token)
+                                if not polygon.is_empty:
+                                    coords = np.array(polygon.exterior.coords)
+                                    if len(coords) > 2:
+                                        coords_ego = self._world_to_grid(coords, ego_pose)
+                                        self._fill_polygon(coords_ego, label, class_id)
+                        
+                        elif layer_name in ['road_divider', 'lane_divider']:
+                            # Handle line segments
+                            line = nusc_map.extract_line(record['line_token'])
+                            if not line.is_empty:
+                                coords = np.array(line.coords)
+                                if len(coords) > 1:
+                                    coords_ego = self._world_to_grid(coords, ego_pose)
+                                    self._draw_line(coords_ego, label, class_id)
+                        
                         else:
-                            poly_record = nusc_map.get(layer_name, token)
-                            if layer_name == 'drivable_area':
-                                for poly_token in poly_record['polygon_tokens']:
-                                    geom = {'polygon': nusc_map.extract_polygon(poly_token)}
-                                    geometries.append(geom)
-                                continue
-                            else:
-                                geom = {'polygon': nusc_map.extract_polygon(poly_record['polygon_token'])}
-                        geometries.append(geom)
-                    
-                    # Render each geometry
-                    for geom in geometries:
-                        self._render_geometry(geom, label, class_id, ego_pose)
-                    
-                except Exception as e:
-                    logging.warning(f"Error processing layer {layer_name}: {e}")
-                    continue
-                    
-        except Exception as e:
-            raise RuntimeError(f"Error generating BEV label: {e}")
+                            # Handle single polygon layers
+                            polygon = nusc_map.extract_polygon(record['polygon_token'])
+                            if not polygon.is_empty:
+                                coords = np.array(polygon.exterior.coords)
+                                if len(coords) > 2:
+                                    coords_ego = self._world_to_grid(coords, ego_pose)
+                                    self._fill_polygon(coords_ego, label, class_id)
+                        
+                    except Exception as e:
+                        logging.warning(f"Error processing record in {layer_name}: {str(e)}")
+                        continue
+                
+                # Log statistics for this layer
+                layer_pixels = np.sum(label == class_id)
+                logging.info(f"Layer {layer_name}: {layer_pixels} pixels filled")
+                
+            except Exception as e:
+                logging.warning(f"Error processing layer {layer_name}: {str(e)}")
+                continue
+        
+        # Log final label statistics
+        unique_labels, counts = np.unique(label, return_counts=True)
+        logging.info("\nFinal label statistics:")
+        for label_id, count in zip(unique_labels, counts):
+            if label_id > 0:  # Skip background
+                layer_name = [k for k, v in self.class_map.items() if v == label_id][0]
+                logging.info(f"{layer_name}: {count} pixels")
         
         return label
 
@@ -451,9 +557,9 @@ class NuScenesBEVLabelDataset(Dataset):
         rotation = Quaternion(ego_pose['rotation']).rotation_matrix
         translation = np.array(ego_pose['translation'][:2])
 
-        # Transform coordinates
-        coords_2d = coords[:, :2]  # Only use x,y coordinates
-        coords_transformed = np.dot(rotation[:2, :2], (coords_2d - translation).T).T
+        # Transform coordinates using the inverse rotation (transpose)
+        coords_transformed = np.dot(rotation[:2, :2].T, (coords[:, :2] - translation).T).T
+
         grid_coords = ((coords_transformed / self.resolution) + center).astype(int)
         
         # Clip to grid bounds
@@ -485,4 +591,38 @@ class NuScenesBEVLabelDataset(Dataset):
                        (cc >= 0) & (cc < self.grid_size)
                 label[rr[valid], cc[valid]] = class_id
         except Exception as e:
-            logging.warning(f"Error drawing line: {e}") 
+            logging.warning(f"Error drawing line: {e}")
+
+    def _verify_map_data(self, location, nusc_map):
+        """Verify that map data exists and is accessible."""
+        # Test different areas of the map
+        test_boxes = [
+            (-100, -100, 100, 100),  # Center
+            (0, 0, 200, 200),        # Positive quadrant
+            (-200, -200, 0, 0)       # Negative quadrant
+        ]
+        
+        for test_box in test_boxes:
+            for layer in ['drivable_area', 'road_segment', 'lane']:
+                records = nusc_map.get_records_in_patch(test_box, layer_names=[layer])
+                if len(records[layer]) > 0:
+                    logging.info(f"Found {len(records[layer])} {layer} records in {location}")
+                    return True
+        
+        return False
+
+    def run_all_tests(self):
+        """Run all validation tests"""
+        try:
+            print("\nRunning validation tests for trainval dataset...")
+            # self.test_calibration()
+            # self.test_data_loading()
+            self.test_bev_visualization()
+            self.test_coordinate_mapping()
+            self.test_map_statistics()
+            # self.test_dataloader()
+            print("\nAll validation tests completed successfully!")
+            
+        except Exception as e:
+            logging.error(f"Validation failed: {e}")
+            raise 

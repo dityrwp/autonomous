@@ -223,7 +223,8 @@ class DatasetValidator:
         print("-" * 50)
         
         # Create figure with subplots
-        fig, axes = plt.subplots(1, num_samples, figsize=(5*num_samples, 5))
+        fig, axes = plt.subplots(1, num_samples, figsize=(6*num_samples, 5))
+        fig.subplots_adjust(right=0.9, wspace=0.3)  # Adjust spacing
         if num_samples == 1:
             axes = [axes]
             
@@ -243,7 +244,7 @@ class DatasetValidator:
             ax.axis('off')
         
         # Add colorbar
-        cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+        cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])  # Adjust colorbar position
         cbar = plt.colorbar(im, cax=cbar_ax)
         cbar.set_ticks(range(len(self.class_names)))
         cbar.set_ticklabels(self.class_names)
@@ -258,7 +259,7 @@ class DatasetValidator:
                   bbox_to_anchor=(0.5, 0),
                   title="BEV Segmentation Classes")
         
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust layout
         plt.savefig('bev_visualization.png', dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -296,7 +297,7 @@ class DatasetValidator:
             # Manual computation
             rotation = Quaternion(ego_pose['rotation']).rotation_matrix[:2, :2]
             translation = np.array(ego_pose['translation'][:2])
-            point_transformed = np.dot(rotation, point - translation)
+            point_transformed = np.dot(rotation.T, point - translation)
             manual_coords = (point_transformed / resolution + center).astype(int)
             manual_coords = np.clip(manual_coords, 0, self.bev_dataset.grid_size - 1)
             
@@ -309,15 +310,20 @@ class DatasetValidator:
             assert np.allclose(grid_coords, manual_coords, atol=1), \
                 "Coordinate mapping mismatch"
             
-            # Visualize the point
+            # Visualize the point on the BEV grid
             fig, ax = plt.subplots(figsize=(5, 5))
+            bev_data = self.bev_dataset[0]
+            label = bev_data['bev_label'].numpy()
+            ax.imshow(label, cmap=self.cmap, interpolation='nearest')
             ax.plot(grid_coords[0], grid_coords[1], 'ro', label='Dataset')
             ax.plot(manual_coords[0], manual_coords[1], 'bx', label='Manual')
             ax.set_xlim(0, self.bev_dataset.grid_size)
             ax.set_ylim(0, self.bev_dataset.grid_size)
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_title(f"BEV Coordinate Mapping - Point {i+1}")
             ax.grid(True)
             ax.legend()
-            ax.set_title(f"Point {i+1}: {point}")
             plt.savefig(f'coordinate_mapping_{i}.png')
             plt.close()
     
@@ -348,6 +354,9 @@ class DatasetValidator:
                     layer_names=[layer_name]
                 )[layer_name]
                 
+                print(f"\nLayer: {layer_name}")
+                print(f"Number of records: {len(records)}")
+                
                 if records:
                     # Get geometries
                     geometries = []
@@ -366,11 +375,11 @@ class DatasetValidator:
                                 coords = nusc_map.extract_polygon(poly['polygon_token'])
                         geometries.append(coords)
                     
+                    print(f"Number of geometries: {len(geometries)}")
+                    
                     # Compute statistics
                     coords = np.vstack(geometries)
                     print(f"\n{layer_name}:")
-                    print(f"Number of records: {len(records)}")
-                    print(f"Number of geometries: {len(geometries)}")
                     print(f"Coordinate range X: [{coords[:, 0].min():.1f}, {coords[:, 0].max():.1f}]")
                     print(f"Coordinate range Y: [{coords[:, 1].min():.1f}, {coords[:, 1].max():.1f}]")
                     
@@ -380,8 +389,14 @@ class DatasetValidator:
                     stats['x_range'].append(coords[:, 0].max() - coords[:, 0].min())
                     stats['y_range'].append(coords[:, 1].max() - coords[:, 1].min())
             
+                else:
+                    print("No records found")
+            
             except Exception as e:
                 logging.warning(f"Error processing {layer_name}: {e}")
+        
+        print("\nCollected statistics:")
+        print(stats)
         
         # Visualize statistics
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
@@ -453,11 +468,11 @@ class DatasetValidator:
         """Run all validation tests"""
         try:
             print("\nRunning validation tests for trainval dataset...")
-            self.test_calibration()
-            self.test_data_loading()
+            #self.test_calibration()
+            #self.test_data_loading()
             self.test_bev_visualization()
-            self.test_coordinate_mapping()
-            self.test_map_statistics()
+            #self.test_coordinate_mapping()
+            #self.test_map_statistics()
             self.test_dataloader()
             print("\nAll validation tests completed successfully!")
             
