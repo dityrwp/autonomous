@@ -8,8 +8,13 @@ from nuscenes.utils.data_classes import LidarPointCloud
 from nuscenes.map_expansion.map_api import NuScenesMap
 from pyquaternion import Quaternion
 import logging
-from shapely.geometry import Polygon, LineString
+from shapely.geometry import Polygon, LineString, MultiPolygon, Point
 import json
+import matplotlib.pyplot as plt
+from descartes.patch import PolygonPatch
+from matplotlib.colors import ListedColormap
+from shapely.prepared import prep
+from shapely.geometry import MultiPoint
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -19,7 +24,7 @@ def patched_load_table(self, table_name):
     with open(filepath, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-NuScenes.__load_table__ = patched_load_table
+NuScenes._load_table_ = patched_load_table
 
 class NuScenesFilteredDataset(Dataset):
     """Filters nuScenes samples to only include frames with both front camera and LiDAR."""
@@ -39,12 +44,12 @@ class NuScenesFilteredDataset(Dataset):
         
         # Shared class map
         self.class_map = {
-            'drivable_area': 0,
-            'road_segment': 1,
-            'road_block': 2,
-            'lane': 3,
-            'road_divider': 4,
-            'lane_divider': 5
+            'background': 0,
+            'drivable_area': 1,
+            'lane_divider': 2,
+            'road_divider': 3,
+            'ped_crossing': 4,
+            'walkway': 5
         }
 
     def _filter_samples(self):
@@ -256,7 +261,7 @@ class NuScenesFilteredDataset(Dataset):
 class NuScenesBEVLabelDataset(Dataset):
     """Generates BEV segmentation labels from filtered samples."""
     
-    def __init__(self, filtered_dataset, grid_size=128, resolution=0.2):
+    def __init__(self, filtered_dataset, grid_size=256, resolution=0.2):
         self.filtered_dataset = filtered_dataset
         self.grid_size = grid_size
         self.resolution = resolution
@@ -276,12 +281,32 @@ class NuScenesBEVLabelDataset(Dataset):
         self._initialize_maps()
         self._validate_samples()
         
+        # Define consistent color map for visualization
+        self.color_map = {
+            'background': '#000000',     # Black for background
+            'drivable_area': '#a6cee3',  # Light blue
+            'road_divider': '#b2b2b2',   # Gray
+            'lane_divider': '#fdbf6f',   # Orange
+            'walkway': '#e31a1c',        # Red
+            'ped_crossing': '#fb9a99'    # Pink
+        }
+        
+        # Convert hex colors to RGB for visualization
+        self.rgb_colors = {}
+        for layer, hex_color in self.color_map.items():
+            hex_color = hex_color.lstrip('#')
+            self.rgb_colors[layer] = tuple(int(hex_color[i:i+2], 16)/255 for i in (0, 2, 4))
+            
         logging.info(f"Initialized BEV dataset with {len(self.valid_samples)} valid samples")
 
     def _initialize_maps(self):
         """Initialize and cache maps for all locations."""
-        map_locations = ['singapore-onenorth', 'singapore-hollandvillage', 
-                        'singapore-queenstown', 'boston-seaport']
+        map_locations = [
+            'singapore-onenorth',
+            'singapore-hollandvillage',
+            'singapore-queenstown',
+            'boston-seaport'
+        ]
         
         for location in map_locations:
             try:
@@ -343,7 +368,7 @@ class NuScenesBEVLabelDataset(Dataset):
                     
                     # Check for any map data in the patch
                     found_data = False
-                    for layer in ['drivable_area', 'road_segment', 'lane']:
+                    for layer in ['drivable_area', 'lane']:  # Removed road_segment
                         try:
                             records = nusc_map.get_records_in_patch(patch_box, layer_names=[layer])
                             if records and len(records[layer]) > 0:
@@ -431,24 +456,33 @@ class NuScenesBEVLabelDataset(Dataset):
             logging.error(f"Error generating BEV label for sample {sample_token}: {e}")
             raise
 
+    def box_to_polygon(self, box):
+        """Convert box coordinates to Shapely Polygon."""
+        xmin, ymin, xmax, ymax = box
+        return Polygon([(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)])
+
     def _generate_bev_label(self, sample_token, ego_pose):
-        """Generate BEV segmentation label."""
-        label = np.zeros((self.grid_size, self.grid_size), dtype=np.uint8)
+        """Generate BEV segmentation label by direct rasterization from map."""
+        # Initialize label with background class
+        label = np.zeros((self.grid_size, self.grid_size), dtype=np.uint8)  # Will be class 0 (background)
         
-        # Get scene location
+        # Get scene location and sample data
         sample = self.nusc.get('sample', sample_token)
         scene = self.nusc.get('scene', sample['scene_token'])
         log = self.nusc.get('log', scene['log_token'])
         location = log['location']
         
-        logging.info(f"\nGenerating BEV label for sample {sample_token}")
-        logging.info(f"Location: {location}")
+        # Get front camera image for validation
+        cam_token = sample['data']['CAM_FRONT']
+        cam_data = self.nusc.get('sample_data', cam_token)
+        cam_path = os.path.join(self.nusc.dataroot, cam_data['filename'])
         
+        # Get map and validate
         nusc_map = self.map_cache.get(location)
         if nusc_map is None:
             raise RuntimeError(f"Map not found for location: {location}")
         
-        # Calculate patch box
+        # Calculate patch box and validate ego pose
         patch_size = self.grid_size * self.resolution
         ego_x, ego_y = ego_pose['translation'][:2]
         patch_box = (
@@ -458,112 +492,231 @@ class NuScenesBEVLabelDataset(Dataset):
             ego_y + patch_size/2
         )
         
-        logging.info(f"Ego position: ({ego_x:.2f}, {ego_y:.2f})")
-        logging.info(f"Patch box: {patch_box}")
+        # Get rotation matrix and heading
+        rotation_matrix = Quaternion(ego_pose['rotation']).rotation_matrix
+        # Calculate heading angle (front is positive x-axis in vehicle frame)
+        heading_angle = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]) 
         
-        # Process each map layer
-        for layer_name, class_id in self.class_map.items():
+        # Create figure with 2 subplots
+        fig = plt.figure(figsize=(10, 8))
+        gs = plt.GridSpec(2, 1, height_ratios=[1, 1.2])
+        
+        # Front camera view
+        ax_cam = fig.add_subplot(gs[0])
+        ax_cam.set_title("Front Camera View")
+        if os.path.exists(cam_path):
+            img = plt.imread(cam_path)
+            ax_cam.imshow(img)
+        ax_cam.axis('off')
+        
+        # BEV grid view
+        ax_bev = fig.add_subplot(gs[1])
+        ax_bev.set_title(f"BEV Grid View ({self.grid_size}x{self.grid_size} @ {self.resolution}m/pixel)")
+        
+        # Define rendering order (from bottom to top)
+        layer_order = [
+            'drivable_area',  # Render drivable area first
+            'walkway',        # Render walkways on top of drivable area
+            'ped_crossing',   # Render pedestrian crossings next
+            'road_divider',   # Render road and lane dividers last
+            'lane_divider'    
+        ]
+        
+        # Initialize BEV grid with background color
+        bev_grid = np.zeros((self.grid_size, self.grid_size), dtype=np.uint8)
+        bev_grid[:] = self.class_map['background']
+        
+        # Process layers in order
+        for layer_name in layer_order:
+            if layer_name not in self.class_map:
+                continue
+            
+            class_id = self.class_map[layer_name]
+            
             try:
-                # Get records in patch
                 records = nusc_map.get_records_in_patch(patch_box, layer_names=[layer_name])
                 layer_records = records.get(layer_name, [])
                 
                 logging.info(f"\nProcessing layer {layer_name}: found {len(layer_records)} records")
+                
+                # Collect all polygons for this layer
+                polygons = []
                 
                 for record_token in layer_records:
                     try:
                         record = nusc_map.get(layer_name, record_token)
                         
                         if layer_name == 'drivable_area':
-                            # Handle multiple polygons for drivable area
                             for poly_token in record['polygon_tokens']:
                                 polygon = nusc_map.extract_polygon(poly_token)
                                 if not polygon.is_empty:
-                                    coords = np.array(polygon.exterior.coords)
-                                    if len(coords) > 2:
-                                        coords_ego = self._world_to_grid(coords, ego_pose)
-                                        self._fill_polygon(coords_ego, label, class_id)
+                                    polygons.append(polygon)
                         
                         elif layer_name in ['road_divider', 'lane_divider']:
-                            # Handle line segments
                             line = nusc_map.extract_line(record['line_token'])
                             if not line.is_empty:
-                                coords = np.array(line.coords)
-                                if len(coords) > 1:
-                                    coords_ego = self._world_to_grid(coords, ego_pose)
-                                    self._draw_line(coords_ego, label, class_id)
+                                # Increase buffer size for dividers to make them more visible
+                                buffer_size = 0.35 if layer_name == 'road_divider' else 0.25
+                                polygon = line.buffer(buffer_size)
+                                if not polygon.is_empty:
+                                    polygons.append(polygon)
                         
                         else:
-                            # Handle single polygon layers
                             polygon = nusc_map.extract_polygon(record['polygon_token'])
                             if not polygon.is_empty:
-                                coords = np.array(polygon.exterior.coords)
-                                if len(coords) > 2:
-                                    coords_ego = self._world_to_grid(coords, ego_pose)
-                                    self._fill_polygon(coords_ego, label, class_id)
-                        
+                                polygons.append(polygon)
+                    
                     except Exception as e:
                         logging.warning(f"Error processing record in {layer_name}: {str(e)}")
                         continue
                 
-                # Log statistics for this layer
-                layer_pixels = np.sum(label == class_id)
-                logging.info(f"Layer {layer_name}: {layer_pixels} pixels filled")
-                
+                if polygons:
+                    # Transform polygons to ego vehicle coordinates
+                    transformed_polys = []
+                    for polygon in polygons:
+                        # Translate 
+                        poly_coords = np.array(polygon.exterior.coords)
+                        poly_coords -= np.array(ego_pose['translation'][:2])
+                        
+                        # Rotate by negative heading angle
+                        # Flip heading to make ego face north
+                        theta = heading_angle - np.pi/2
+                        c, s = np.cos(theta), np.sin(theta)
+                        R = np.array(((c, -s), (s, c)))
+                        poly_coords = np.dot(poly_coords, R)
+                        
+                        transformed_polys.append(Polygon(-poly_coords))
+                    
+                    # Create grid points in BEV coordinates
+                    x = np.linspace(-self.grid_size/2, self.grid_size/2, self.grid_size)
+                    y = np.linspace(-self.grid_size/2, self.grid_size/2, self.grid_size)
+                    grid_x, grid_y = np.meshgrid(x, y)
+                    points = np.stack((-grid_x.flatten(), grid_y.flatten()), axis=1)
+                    
+                    # Scale by resolution to get BEV grid coordinates
+                    points = points * self.resolution
+                    
+                    # Test points against transformed polygons using prepared geometries
+                    mask = np.zeros(len(points), dtype=bool)
+                    
+                    # Convert points to list of Point objects once
+                    points = [Point(p) for p in points]
+                    
+                    # Union all polygons of the same class for faster contains test
+                    if transformed_polys:
+                        merged_poly = transformed_polys[0]
+                        for poly in transformed_polys[1:]:
+                            merged_poly = merged_poly.union(poly)
+                        
+                        # Prepare geometry for faster contains testing
+                        prepared_poly = prep(merged_poly)
+                        
+                        # Test all points at once
+                        mask = np.array([prepared_poly.contains(point) for point in points])
+                    
+                    # Reshape mask back to grid
+                    mask = mask.reshape(self.grid_size, self.grid_size)
+                    bev_grid[mask] = class_id
+            
             except Exception as e:
-                logging.warning(f"Error processing layer {layer_name}: {str(e)}")
+                logging.error(f"Error processing layer {layer_name}: {str(e)}")
                 continue
         
-        # Log final label statistics
-        unique_labels, counts = np.unique(label, return_counts=True)
-        logging.info("\nFinal label statistics:")
-        for label_id, count in zip(unique_labels, counts):
-            if label_id > 0:  # Skip background
-                layer_name = [k for k, v in self.class_map.items() if v == label_id][0]
-                logging.info(f"{layer_name}: {count} pixels")
+        # Convert class IDs to RGB colors for visualization
+        bev_vis = np.zeros((self.grid_size, self.grid_size, 3), dtype=np.uint8)
+        for class_name, class_id in self.class_map.items():
+            mask = (bev_grid == class_id)
+            # Convert hex color to RGB values
+            hex_color = self.color_map[class_name].lstrip('#')
+            rgb_color = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+            bev_vis[mask] = rgb_color
         
-        return label
-
-    def _render_geometry(self, polygon, label, class_id, ego_pose):
-        """Converts world coordinates to BEV grid and rasterizes."""
-        try:
-            # Convert to shapely polygon
-            if isinstance(polygon['polygon'], (Polygon, LineString)):
-                geom = polygon['polygon']
-            else:
-                geom = Polygon(polygon['polygon'])
-            
-            # Get coordinates
-            if isinstance(geom, Polygon):
-                coords = np.array(geom.exterior.coords)
-            else:  # LineString
-                coords = np.array(geom.coords)
-            
-            # Transform to grid
-            grid_coords = self._world_to_grid(coords, ego_pose)
-            
-            # Render based on geometry type
-            if isinstance(geom, Polygon) and len(grid_coords) >= 3:
-                self._fill_polygon(grid_coords, label, class_id)
-            elif isinstance(geom, LineString) and len(grid_coords) >= 2:
-                self._draw_line(grid_coords, label, class_id)
-                
-        except Exception as e:
-            logging.warning(f"Error rendering geometry: {e}")
+        # Show composite BEV
+        ax_bev.imshow(bev_vis)  # Removed origin='lower' to match the label orientation
+        
+        # Draw ego vehicle in BEV (center of the grid)
+        ego_bev_x = self.grid_size // 2
+        ego_bev_y = self.grid_size // 2
+        #ax_bev.plot(ego_bev_x, ego_bev_y, 'ro', markersize=10, label='Ego Vehicle')
+        
+        # Draw ego vehicle heading in BEV (pointing up)
+        # heading_length = 20  # pixels
+        # ax_bev.arrow(ego_bev_x, ego_bev_y, 
+        #             0, -heading_length,  # Point up in BEV
+        #             head_width=5, head_length=5, fc='r', ec='r')
+        
+        # # Add distance markers in BEV
+        # for dist in [5, 10, 15, 20, 25]:
+        #     pixels = dist / self.resolution
+        #     circle = plt.Circle((ego_bev_x, ego_bev_y), pixels, 
+        #                       color='gray', fill=False, linestyle='--', alpha=0.3)
+        #     ax_bev.add_patch(circle)
+        #     ax_bev.text(ego_bev_x + pixels, ego_bev_y, f'{dist}m', 
+        #                color='gray', alpha=0.5)
+        
+        # # Add coordinate axes in BEV
+        # ax_bev.axhline(y=ego_bev_y, color='gray', linestyle='--', alpha=0.3)
+        # ax_bev.axvline(x=ego_bev_x, color='gray', linestyle='--', alpha=0.3)
+        
+        # Add grid markers in meters
+        meter_ticks = np.arange(-25, 26, 5)
+        pixel_ticks = meter_ticks / self.resolution + self.grid_size // 2
+        ax_bev.set_xticks(pixel_ticks[::2])  # Show every other tick to avoid crowding
+        ax_bev.set_yticks(pixel_ticks[::2])
+        ax_bev.set_xticklabels([f'{x}m' for x in meter_ticks[::2]])
+        ax_bev.set_yticklabels([f'{y}m' for y in meter_ticks[::2]])
+        
+        # Set axis properties
+        ax_bev.set_aspect('equal')
+        ax_bev.grid(True, alpha=0.3)
+        ax_bev.set_xlabel("BEV Grid X (meters)")
+        ax_bev.set_ylabel("BEV Grid Y (meters)")
+        
+        # Add colorbar
+        cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+        colors = [self.rgb_colors[name] for name in self.class_map.keys()]
+        cmap = ListedColormap(colors)
+        norm = plt.Normalize(vmin=0, vmax=len(self.class_map)-1)
+        cbar = plt.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), cax=cbar_ax)
+        cbar.set_ticks(np.arange(len(self.class_map)) + 0.5)
+        cbar.set_ticklabels(list(self.class_map.keys()))
+        cbar.ax.tick_params(labelsize=8)
+        
+        plt.tight_layout()
+        plt.savefig(f"bev_debug_{sample_token}.png", dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return bev_grid  # Return class IDs for training
 
     def _world_to_grid(self, coords, ego_pose):
         """Transforms world coordinates to BEV grid indices."""
-        center = self.grid_size // 2
-        rotation = Quaternion(ego_pose['rotation']).rotation_matrix
+        # Get rotation matrix from quaternion (only 2x2 part for 2D rotation)
+        rotation = Quaternion(ego_pose['rotation']).rotation_matrix[:2, :2]
         translation = np.array(ego_pose['translation'][:2])
 
-        # Transform coordinates using the inverse rotation (transpose)
-        coords_transformed = np.dot(rotation[:2, :2].T, (coords[:, :2] - translation).T).T
-
-        grid_coords = ((coords_transformed / self.resolution) + center).astype(int)
+        # Debug prints for transformation components - only print first point as example
+        logging.info(f"Sample coordinate transformation:")
+        logging.info(f"- Original first point: {coords[0]}")
         
-        # Clip to grid bounds
+        # 1. Center coordinates at ego vehicle position
+        coords_centered = coords[:, :2] - translation
+        logging.info(f"- After centering: {coords_centered[0]}")
+        
+        # 2. Rotate coordinates to align with ego vehicle orientation
+        coords_rotated = np.dot(rotation, coords_centered.T).T
+        logging.info(f"- After rotation: {coords_rotated[0]}")
+        
+        # 3. Scale to grid resolution and shift to center of grid
+        grid_coords = (coords_rotated / self.resolution + self.grid_size/2).astype(int)
+        logging.info(f"- Final grid coords: {grid_coords[0]}")
+        
+        # Clip coordinates to grid bounds
         grid_coords = np.clip(grid_coords, 0, self.grid_size - 1)
+        
+        # Print summary statistics instead of all coordinates
+        logging.info(f"Coordinate ranges:")
+        logging.info(f"- X range: [{grid_coords[:, 0].min()}, {grid_coords[:, 0].max()}]")
+        logging.info(f"- Y range: [{grid_coords[:, 1].min()}, {grid_coords[:, 1].max()}]")
         
         return grid_coords
 
@@ -574,24 +727,44 @@ class NuScenesBEVLabelDataset(Dataset):
             grid_x, grid_y = np.meshgrid(np.arange(self.grid_size), np.arange(self.grid_size))
             points = np.vstack((grid_x.ravel(), grid_y.ravel())).T
             
-            mask = Path(coords).contains_points(points)
+            path = Path(coords)
+            mask = path.contains_points(points)
             mask = mask.reshape(self.grid_size, self.grid_size)
             label[mask] = class_id
         except Exception as e:
             logging.warning(f"Error filling polygon: {e}")
 
-    def _draw_line(self, coords, label, class_id, thickness=1):
+    def _draw_line(self, coords, label, class_id):
         """Draws lines in the BEV grid."""
         try:
-            from skimage.draw import line_aa
+            from skimage.draw import line
             for i in range(len(coords) - 1):
-                rr, cc, _ = line_aa(coords[i, 1], coords[i, 0], 
-                                  coords[i+1, 1], coords[i+1, 0])
-                valid = (rr >= 0) & (rr < self.grid_size) & \
-                       (cc >= 0) & (cc < self.grid_size)
+                start = coords[i]
+                end = coords[i + 1]
+                
+                # Skip if either point is outside the grid
+                if not (0 <= start[0] < self.grid_size and 0 <= start[1] < self.grid_size and
+                       0 <= end[0] < self.grid_size and 0 <= end[1] < self.grid_size):
+                    continue
+                
+                # Draw the line
+                rr, cc = line(int(start[1]), int(start[0]), int(end[1]), int(end[0]))
+                
+                # Filter points within grid bounds
+                valid = (rr >= 0) & (rr < self.grid_size) & (cc >= 0) & (cc < self.grid_size)
                 label[rr[valid], cc[valid]] = class_id
+                
+                # # Draw thicker line by adding adjacent pixels
+                # for offset in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+                #     rr_offset = rr[valid] + offset[0]
+                #     cc_offset = cc[valid] + offset[1]
+                #     valid_offset = (rr_offset >= 0) & (rr_offset < self.grid_size) & \
+                #                  (cc_offset >= 0) & (cc_offset < self.grid_size)
+                #     label[rr_offset[valid_offset], cc_offset[valid_offset]] = class_id
+                
         except Exception as e:
             logging.warning(f"Error drawing line: {e}")
+            return
 
     def _verify_map_data(self, location, nusc_map):
         """Verify that map data exists and is accessible."""
@@ -603,7 +776,7 @@ class NuScenesBEVLabelDataset(Dataset):
         ]
         
         for test_box in test_boxes:
-            for layer in ['drivable_area', 'road_segment', 'lane']:
+            for layer in ['drivable_area', 'lane']:  # Removed road_segment
                 records = nusc_map.get_records_in_patch(test_box, layer_names=[layer])
                 if len(records[layer]) > 0:
                     logging.info(f"Found {len(records[layer])} {layer} records in {location}")

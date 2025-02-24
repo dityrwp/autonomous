@@ -4,9 +4,13 @@ import torch
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
+
 import logging
 from tqdm import tqdm
 from pyquaternion import Quaternion
+from shapely.geometry import Polygon
+from descartes import PolygonPatch
+import random
 
 from nuscenes_data import NuScenesFilteredDataset, NuScenesBEVLabelDataset
 
@@ -28,19 +32,24 @@ class DatasetValidator:
         
         self.bev_dataset = NuScenesBEVLabelDataset(
             filtered_dataset=self.filtered_dataset,
-            grid_size=128,
+            grid_size=256,
             resolution=0.2
         )
         
         # Color map for visualization
+        def hex_to_rgb(hex_color):
+            """Convert hex color to RGB values (0-255)."""
+            hex_color = hex_color.lstrip('#')
+            return [int(hex_color[i:i+2], 16) for i in (0, 2, 4)]
+        
+        # Using the provided color scheme
         self.class_colors = {
-            'background': [0, 0, 0],       # Black
-            'drivable_area': [255, 255, 255], # White
-            'road_segment': [200, 200, 200], # Light gray
-            'road_block': [150, 150, 150],  # Gray
-            'lane': [100, 200, 100],       # Green
-            'road_divider': [255, 200, 0],  # Yellow
-            'lane_divider': [200, 100, 100] # Red
+            'background': [50, 50, 50],       # Dark gray background
+            'drivable_area': hex_to_rgb('#a6cee3'),
+            'road_divider': hex_to_rgb('#cab2d6'),
+            'lane_divider': hex_to_rgb('#6a3d9a'),
+            'walkway': hex_to_rgb('#e31a1c'),
+            'ped_crossing': hex_to_rgb('#fb9a99')
         }
         self.colors = list(self.class_colors.values())
         self.class_names = list(self.class_colors.keys())
@@ -98,6 +107,14 @@ class DatasetValidator:
                 print(f"  {f}")
         
         logging.info("All required trainval dataset files found")
+    
+    def get_random_samples(self, num_samples=3):
+        """Get random sample indices from the dataset."""
+        total_samples = len(self.bev_dataset)
+        if total_samples < num_samples:
+            logging.warning(f"Requested {num_samples} samples but only {total_samples} available")
+            return list(range(total_samples))
+        return random.sample(range(total_samples), num_samples)
     
     def test_calibration(self, num_samples=3):
         """Test 1: Calibration matrix validation (95% confidence)"""
@@ -217,53 +234,163 @@ class DatasetValidator:
         else:
             print(f"\nSuccessfully validated {successful_samples} samples")
     
-    def test_bev_visualization(self, num_samples=3):
-        """Test 3: BEV label visualization (90% confidence)"""
-        print("\nTest 3: BEV Label Visualization")
+    def test_bev_visualization(self, num_samples=12):
+        """Test 3: BEV label visualization and raw map layers (90% confidence)"""
+        print("\nTest 3: BEV Label and Map Layer Visualization")
         print("-" * 50)
         
-        # Create figure with subplots
-        fig, axes = plt.subplots(1, num_samples, figsize=(6*num_samples, 5))
-        fig.subplots_adjust(right=0.9, wspace=0.3)  # Adjust spacing
-        if num_samples == 1:
-            axes = [axes]
+        # Get random sample indices
+        random_indices = self.get_random_samples(num_samples)
+        logging.info(f"Selected random samples: {random_indices}")
+        
+        # Calculate number of rows and columns for better visualization
+        num_cols = min(4, num_samples)  # Maximum 4 columns
+        num_rows = (num_samples + num_cols - 1) // num_cols  # Ceiling division
+        
+        # Create figure with subplots - 2 sets of visualizations (BEV and raw map)
+        fig, axes = plt.subplots(2 * num_rows, num_cols, figsize=(5*num_cols, 5*2*num_rows))
+        fig.subplots_adjust(right=0.9, wspace=0.3, hspace=0.4)
+        
+        # Process each sample
+        for i, idx in enumerate(random_indices):
+            row = (i // num_cols) * 2  # Multiply by 2 because we have two rows per sample
+            col = i % num_cols
             
-        # Create BEV visualizations
-        for idx, ax in enumerate(axes):
+            # Get axes for this sample (both BEV and raw map)
+            if num_rows * num_cols > 1:
+                bev_ax = axes[row, col]
+                map_ax = axes[row + 1, col]
+            else:
+                bev_ax = axes[0]
+                map_ax = axes[1]
+            
+            # Get sample data
             bev_data = self.bev_dataset[idx]
+            sample_token = bev_data['sample_token']
+            
+            # Get scene location for map data
+            sample = self.bev_dataset.nusc.get('sample', sample_token)
+            scene = self.bev_dataset.nusc.get('scene', sample['scene_token'])
+            log = self.bev_dataset.nusc.get('log', scene['log_token'])
+            location = log['location']
+            nusc_map = self.bev_dataset.map_cache[location]
+            
+            # 1. Plot rasterized BEV
             label = bev_data['bev_label'].numpy()
+            im = bev_ax.imshow(label, cmap=self.cmap, interpolation='nearest', aspect='equal')
             
-            # Plot label
-            im = ax.imshow(label, cmap=self.cmap, interpolation='nearest')
+        #     # Mark ego vehicle rear position
+        #     rear_x = self.bev_dataset.grid_size // 2
+        #     rear_y = self.bev_dataset.grid_size - 1
+        #     bev_ax.plot(rear_x, rear_y, 'ro', markersize=10, label='Ego Rear')
             
-            # Add title with statistics
-            unique_labels = np.unique(label)
-            label_stats = [f"{self.class_names[l]}: {np.sum(label == l)}" 
-                          for l in unique_labels if l > 0]
-            ax.set_title(f"Sample {idx}\n" + "\n".join(label_stats), fontsize=8)
-            ax.axis('off')
+        #     # Add title with statistics
+        #     unique_labels = np.unique(label)
+        #     label_stats = [f"{self.class_names[l]}: {np.sum(label == l)}" 
+        #                   for l in unique_labels if l > 0]
+        #     bev_ax.set_title(f"BEV Sample {idx}\n" + "\n".join(label_stats), 
+        #                     fontsize=8)
+        #     bev_ax.axis('off')
+            
+        #     # Add grid lines to rasterized view
+        #     # bev_ax.grid(True, alpha=0.3, linestyle='--')
+        #     # bev_ax.set_xticks(np.arange(0, 256, 32))
+        #     # bev_ax.set_yticks(np.arange(0, 256, 32))
+            
+        #     # 2. Plot raw map layers
+        #     map_ax.set_aspect('equal')
+            
+        #     # Get ego pose for the patch
+        #     sample = self.bev_dataset.filtered_dataset[idx]
+        #     ego_pose = sample['ego_pose']
+        #     patch_size = self.bev_dataset.grid_size * self.bev_dataset.resolution
+        #     patch_box = (
+        #         ego_pose['translation'][0] - patch_size/2,
+        #         ego_pose['translation'][1] - patch_size/2,
+        #         ego_pose['translation'][0] + patch_size/2,
+        #         ego_pose['translation'][1] + patch_size/2
+        #     )
+            
+        #     # Plot each layer with different colors
+        #     for layer_name in self.class_colors.keys():
+        #         if layer_name == 'background':
+        #             continue
+                    
+        #         try:
+        #             # Get records in patch
+        #             records = nusc_map.get_records_in_patch(patch_box, layer_names=[layer_name])
+        #             layer_records = records.get(layer_name, [])
+                    
+        #             color = np.array(self.class_colors[layer_name])/255.0
+                    
+        #             for token in layer_records:
+        #                 if layer_name == 'drivable_area':
+        #                     polygons = [nusc_map.extract_polygon(poly_token) 
+        #                               for poly_token in nusc_map.get(layer_name, token)['polygon_tokens']]
+        #                     for polygon in polygons:
+        #                         if not polygon.is_empty:
+        #                             patch = PolygonPatch(polygon, color=color, alpha=0.5)
+        #                             map_ax.add_patch(patch)
+                        
+        #                 elif layer_name in ['road_divider', 'lane_divider']:
+        #                     line = nusc_map.get(layer_name, token)
+        #                     if line['line_token']:
+        #                         line_obj = nusc_map.extract_line(line['line_token'])
+        #                         if not line_obj.is_empty:
+        #                             xs, ys = line_obj.xy
+        #                             map_ax.plot(xs, ys, color=color, linewidth=1, alpha=0.7)
+                        
+        #                 else:  # Other polygon layers
+        #                     polygon = nusc_map.extract_polygon(nusc_map.get(layer_name, token)['polygon_token'])
+        #                     if not polygon.is_empty:
+        #                         patch = PolygonPatch(polygon, color=color, alpha=0.5)
+        #                         map_ax.add_patch(patch)
+                
+        #         except Exception as e:
+        #             print(f"Error plotting layer {layer_name}: {str(e)}")
+            
+        #     # Set map plot limits to patch box
+        #     map_ax.set_xlim(patch_box[0], patch_box[2])
+        #     map_ax.set_ylim(patch_box[1], patch_box[3])
+        #     map_ax.set_title(f"Raw Map - Sample {idx}\n{location}", 
+        #                     fontsize=8)
+            
+        #     # Plot ego vehicle position
+        #     map_ax.plot(ego_pose['translation'][0], ego_pose['translation'][1], 
+        #                 'ro', markersize=10, label='Ego Position')
+        #     map_ax.grid(True)
         
-        # Add colorbar
-        cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])  # Adjust colorbar position
-        cbar = plt.colorbar(im, cax=cbar_ax)
-        cbar.set_ticks(range(len(self.class_names)))
-        cbar.set_ticklabels(self.class_names)
+        # # Remove empty subplots if any
+        # for i in range(i + 1, num_rows * num_cols):
+        #     row = (i // num_cols) * 2
+        #     col = i % num_cols
+        #     if num_rows * num_cols > 1:
+        #         axes[row, col].remove()
+        #         axes[row + 1, col].remove()
         
-        # Add legend
-        legend_elements = [plt.Rectangle((0,0),1,1, facecolor=np.array(color)/255.0, 
-                                       label=name)
-                         for name, color in zip(self.class_names, self.colors)]
-        fig.legend(handles=legend_elements, 
-                  loc='lower center', 
-                  ncol=len(self.class_names)//2,
-                  bbox_to_anchor=(0.5, 0),
-                  title="BEV Segmentation Classes")
+        # # Add colorbar
+        # cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+        # cbar = plt.colorbar(im, cax=cbar_ax)
+        # cbar.set_ticks(range(len(self.class_names)))
+        # cbar.set_ticklabels(self.class_names)
+        # cbar.ax.tick_params(labelsize=8)
         
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust layout
-        plt.savefig('bev_visualization.png', dpi=300, bbox_inches='tight')
-        plt.close()
+        # # Add legend
+        # legend_elements = [plt.Rectangle((0,0),1,1, facecolor=np.array(color)/255.0, 
+        #                                label=name)
+        #                  for name, color in zip(self.class_names[1:], self.colors[1:])]  # Skip background
+        # fig.legend(handles=legend_elements, 
+        #           loc='lower center', 
+        #           ncol=len(self.class_names)//2,
+        #           bbox_to_anchor=(0.5, 0),
+        #           title="BEV Segmentation Classes",
+        #           fontsize=8)
         
-        print(f"Saved BEV visualization to bev_visualization.png")
+        # plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        # plt.savefig('bev_visualization_random_samples.png', dpi=300, bbox_inches='tight')
+        # plt.close()
+        
+        # print(f"Saved BEV visualization to bev_visualization_random_samples.png")
     
     def test_coordinate_mapping(self):
         """Test 4: Coordinate mapping validation (100% confidence)"""
@@ -485,7 +612,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     
     # Set dataset path for trainval
-    dataroot = "C:\\nuscenes07"  # Update this to your trainval dataset path
+    dataroot = "C:/nuscenes07"  # Update this to your trainval dataset path
     
     try:
         # Run validation
