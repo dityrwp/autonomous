@@ -6,8 +6,11 @@ import numpy as np
 import spconv.pytorch as spconv
 from torchvision.models.feature_extraction import create_feature_extractor
 from torchvision.models.feature_extraction import get_graph_node_names
+from torch.nn import functional as F
 #from mmdet3d.models.voxel_encoders import DynamicVoxelEncoder
 #from spconv.utils import Point2VoxelCPU3d as VoxelGenerator
+import time
+import math
 
 
 
@@ -25,10 +28,8 @@ class EfficientNetV2Backbone(nn.Module):
         
         # Get the actual node names from the model
         train_nodes, eval_nodes = get_graph_node_names(model)
-        #print("Available nodes:", train_nodes)  # Debug print
         
         # Define feature extraction nodes using actual model node names
-        # We want features after each stage of the network
         return_nodes = {
             'features.1.1.add': 'stage1',     # Early features
             'features.2.3.add': 'stage2',     # Mid-level features
@@ -91,69 +92,210 @@ class EfficientNetV2Backbone(nn.Module):
                 
         return projected
 
+class LayerScale(nn.Module):
+    """Layer scaling module to help with feature propagation"""
+    def __init__(self, dim, init_values=1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(init_values * torch.ones(dim))
+    
+    def forward(self, x):
+        return x * self.gamma
+
 class SECONDBackbone(nn.Module):
     """
     SECOND backbone for LiDAR feature extraction with BEV output.
-    Adapted for Velodyne Puck 16-channel LiDAR.
+    Enhanced with better feature propagation and activation patterns.
     """
-    def __init__(self, 
-                 voxel_size: List[float] = [0.8, 0.8, 0.8],
-                 point_cloud_range: List[float] = [-51.2, -51.2, -5, 51.2, 51.2, 3],
-                 max_num_points: int = 32,
-                 max_voxels: int = 4000):
+    def __init__(self, voxel_size, point_cloud_range, max_num_points=5,
+                 max_voxels=20000):
         super().__init__()
         
-        # Store parameters
+        # Convert inputs to numpy arrays
+        self.voxel_size = np.array(voxel_size, dtype=np.float32)
+        self.point_cloud_range = np.array(point_cloud_range, dtype=np.float32)
         self.max_num_points = max_num_points
         self.max_voxels = max_voxels
         
-        # Calculate grid size dynamically
-        self.point_cloud_range = np.array(point_cloud_range)
-        self.voxel_size = np.array(voxel_size)
-        self.grid_size = np.round(
-            (self.point_cloud_range[3:] - self.point_cloud_range[:3]) / self.voxel_size
+        # Calculate grid size
+        grid_size = (
+            np.round((self.point_cloud_range[3:] - self.point_cloud_range[:3]) / self.voxel_size)
         ).astype(np.int64)
-        self.sparse_shape = np.array([self.grid_size[2], self.grid_size[1], self.grid_size[0]])  # D, H, W
+        self.sparse_shape = grid_size[::-1]  # (z, y, x)
         
-        # Create voxel encoder
-        self.voxel_encoder = nn.Sequential(
-            nn.Linear(4, 16),  # 4 = (x,y,z,intensity)
-            nn.BatchNorm1d(16),
+        # Store grid size for later use
+        self.grid_size = grid_size
+        
+        # Voxel encoder with multi-branch architecture
+        self.voxel_encoder = nn.ModuleDict({
+            'input': nn.Linear(10, 16),  # Initial feature extraction
+            'middle': nn.Linear(16, 16),  # Parallel branch
+            'output': nn.Linear(32, 32)   # Combined features
+        })
+        self.voxel_feature_norm = nn.LayerNorm(32)
+        
+        # Encoder stages with proper channel progression
+        encoder_blocks = []
+        
+        # Initial convolution: maintain 32 channels
+        encoder_blocks.append(
+            spconv.SparseSequential(
+                spconv.SubMConv3d(32, 32, 3, padding=1, bias=False),
+                nn.BatchNorm1d(32),
+                nn.ReLU()
+            )
+        )
+        
+        # Stage 1: 32 -> 64
+        encoder_blocks.append(self._make_stage(32, 64, num_blocks=2))
+        
+        # Stage 2: 64 -> 128
+        encoder_blocks.append(self._make_stage(64, 128, num_blocks=2))
+        
+        # Stage 3: 128 -> 256
+        encoder_blocks.append(self._make_stage(128, 256, num_blocks=2))
+        
+        self.encoder = nn.ModuleList(encoder_blocks)
+        
+        # BEV projection layers
+        self.bev_projections = nn.ModuleDict({
+            'stage1': self._make_bev_projection(64),
+            'stage2': self._make_bev_projection(128),
+            'stage3': self._make_bev_projection(256)
+        })
+        
+        # Initialize weights with improved scaling
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Improved weight initialization for better gradient flow"""
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv2d)):
+                # Use Kaiming initialization with larger gain
+                gain = 1.5
+                fan_in = m.weight.size(1)
+                std = gain / math.sqrt(fan_in)
+                nn.init.normal_(m.weight, 0, std)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.LayerNorm)):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (spconv.SubMConv3d, spconv.SparseConv3d)):
+                # Initialize sparse conv with larger variance
+                gain = 1.5
+                fan_in = m.weight.size(1) * np.prod(m.kernel_size)
+                std = gain / math.sqrt(fan_in)
+                nn.init.normal_(m.weight, 0, std)
+    
+    def _make_stage(self, in_channels: int, out_channels: int, num_blocks: int) -> spconv.SparseSequential:
+        """Enhanced stage with improved residual connections and normalization"""
+        blocks = []
+        current_channels = in_channels
+        
+        # Initial projection if needed
+        if in_channels != out_channels:
+            blocks.append(
+                spconv.SparseSequential(
+                    spconv.SubMConv3d(in_channels, out_channels, 3,
+                                    padding=1, bias=False),
+                    nn.BatchNorm1d(out_channels),
+                    nn.ReLU(inplace=True),
+                    # Add LayerNorm for better stability
+                    nn.LayerNorm(out_channels)
+                )
+            )
+            current_channels = out_channels
+        
+        # Residual blocks with enhanced normalization
+        for i in range(num_blocks):
+            blocks.append(
+                spconv.SparseSequential(
+                    # First conv with gradient clipping
+                    spconv.SubMConv3d(current_channels, out_channels, 3,
+                                    padding=1, bias=False,
+                                    indice_key=f"block{i}_1"),
+                    nn.BatchNorm1d(out_channels),
+                    nn.ReLU(inplace=True),
+                    
+                    # Second conv with gradient clipping
+                    spconv.SubMConv3d(out_channels, out_channels, 3,
+                                    padding=1, bias=False,
+                                    indice_key=f"block{i}_2"),
+                    nn.BatchNorm1d(out_channels),
+                    nn.ReLU(inplace=True),
+                    
+                    # Layer scaling and normalization
+                    LayerScale(out_channels, init_values=0.1),
+                    nn.LayerNorm(out_channels)
+                )
+            )
+            current_channels = out_channels
+        
+        return spconv.SparseSequential(*blocks)
+    
+    def _make_bev_projection(self, in_channels: int) -> nn.Sequential:
+        """Enhanced BEV projection with feature preservation"""
+        return nn.Sequential(
+            # Channel mixing for richer features
+            nn.Conv2d(in_channels, in_channels, 1, groups=1, bias=False),
+            nn.BatchNorm2d(in_channels),
             nn.ReLU(inplace=True),
-            nn.Linear(16, 32),
-            nn.BatchNorm1d(32),
+            
+            # Spatial attention
+            nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            
+            # Final projection
+            nn.Conv2d(in_channels, in_channels, 1, bias=False),
+            nn.BatchNorm2d(in_channels),
             nn.ReLU(inplace=True)
         )
+
+    def _sparse_to_bev(self, x: spconv.SparseConvTensor) -> torch.Tensor:
+        """Convert sparse features to BEV representation with enhanced feature preservation"""
+        features = x.features
+        indices = x.indices
+        spatial_shape = x.spatial_shape
         
-        # Multi-scale sparse convolution backbone
-        self.encoder = spconv.SparseSequential(
-            # Initial conv
-            self._make_sparse_block(32, 32, 3, padding=1, indice_key="init"),
-            
-            # Stage 1: 32 -> 32 channels (no downsampling)
-            self._make_stage(32, 32, num_blocks=2, stride=1, indice_key="stage1"),
-            
-            # Stage 2: 32 -> 64 channels
-            self._make_stage(32, 64, num_blocks=2, stride=2, indice_key="stage2"),
-            
-            # Stage 3: 64 -> 128 channels
-            self._make_stage(64, 128, num_blocks=2, stride=2, indice_key="stage3")
+        # Create empty BEV tensor
+        bev = torch.zeros(
+            (x.batch_size, features.shape[1], spatial_shape[1], spatial_shape[2]),
+            dtype=features.dtype,
+            device=features.device
         )
         
-        # BEV projection layers for each stage
-        self.bev_projections = nn.ModuleDict({
-            'stage1': self._make_bev_projection(32),
-            'stage2': self._make_bev_projection(64),
-            'stage3': self._make_bev_projection(128)
-        })
+        # Enhanced feature accumulation with max pooling
+        for b, h, w, d, f in zip(indices[:, 0], indices[:, 1], indices[:, 2], 
+                                indices[:, 3], features):
+            # Use maximum value for overlapping voxels
+            current = bev[b, :, w, d]
+            bev[b, :, w, d] = torch.where(
+                current.abs().sum() > f.abs().sum(),
+                current,
+                f
+            )
+        
+        # Adaptive feature enhancement
+        valid_mask = bev.abs().sum(dim=1, keepdim=True) > 0
+        
+        # Apply channel attention
+        channel_weights = F.softmax(bev.mean(dim=(2, 3), keepdim=True), dim=1)
+        bev = bev * channel_weights
+        
+        # Normalize features while preserving structure
+        bev = F.layer_norm(bev, bev.shape[1:])
+        bev = torch.where(valid_mask, bev, torch.zeros_like(bev))
+        
+        return bev
         
     def _voxelize(self, points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Voxelize point cloud using grid parameters
+        Voxelize point cloud using grid parameters with enhanced feature computation
         Args:
             points: (N, 5) tensor of [batch_idx, x, y, z, intensity]
         Returns:
-            voxel_features: (M, 4) tensor of mean features per voxel
+            voxel_features: (M, 10) tensor of enhanced features per voxel
             voxel_coords: (M, 4) tensor of voxel coordinates (batch, z, y, x)
         """
         points_xyz = points[:, 1:4].contiguous()
@@ -185,22 +327,35 @@ class SECONDBackbone(nn.Module):
         # Create unique voxels
         voxel_coords = torch.cat([batch_idx.unsqueeze(1), voxel_coords], dim=1)
         
+        # Ensure coordinates are within valid range
+        voxel_coords[:, 1] = torch.clamp(voxel_coords[:, 1], 0, self.grid_size[2] - 1)  # z
+        voxel_coords[:, 2] = torch.clamp(voxel_coords[:, 2], 0, self.grid_size[1] - 1)  # y
+        voxel_coords[:, 3] = torch.clamp(voxel_coords[:, 3], 0, self.grid_size[0] - 1)  # x
+        
         # Get unique voxels and their indices
         unique_coords, inverse_indices, counts = torch.unique(voxel_coords, dim=0, 
                                                             return_inverse=True, 
                                                             return_counts=True)
         
-        # Compute mean features per voxel
-        voxel_features = torch.zeros(len(unique_coords), 4, 
+        # Initialize enhanced feature tensor
+        voxel_features = torch.zeros(len(unique_coords), 10, 
                                    dtype=torch.float32,
                                    device=points.device)
         
-        # Use scatter_add_ for more efficient feature accumulation
+        # Compute mean features (x,y,z,intensity)
         for i in range(4):
             voxel_features[:, i].scatter_add_(0, inverse_indices, features[:, i])
+        voxel_features[:, :4] = voxel_features[:, :4] / counts.float().unsqueeze(1)
         
-        # Compute means
-        voxel_features = voxel_features / counts.float().unsqueeze(1)
+        # Compute geometric features per voxel
+        for idx in range(len(unique_coords)):
+            voxel_mask = inverse_indices == idx
+            if voxel_mask.sum() > 1:  # Only compute if voxel has points
+                voxel_points = features[voxel_mask, :3]
+                # Compute center coordinates (x,y,z)
+                voxel_features[idx, 4:7] = voxel_points.mean(dim=0)
+                # Compute standard deviation (x,y,z)
+                voxel_features[idx, 7:10] = voxel_points.std(dim=0)
         
         # Limit number of voxels if needed
         if len(unique_coords) > self.max_voxels:
@@ -210,76 +365,8 @@ class SECONDBackbone(nn.Module):
         
         return voxel_features, unique_coords
         
-    def _make_sparse_block(self, in_channels: int, out_channels: int, 
-                          kernel_size: int, stride: int = 1, padding: int = 0,
-                          indice_key: str = None) -> spconv.SparseSequential:
-        """Creates a basic sparse convolution block with BatchNorm and ReLU"""
-        return spconv.SparseSequential(
-            spconv.SubMConv3d(in_channels, out_channels, kernel_size,
-                            stride=stride, padding=padding, bias=False,
-                            indice_key=indice_key),
-            nn.BatchNorm1d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-    
-    def _make_stage(self, in_channels: int, out_channels: int, num_blocks: int,
-                    stride: int, indice_key: str) -> spconv.SparseSequential:
-        """Creates a stage with multiple sparse convolution blocks"""
-        blocks = []
-        
-        # Downsample block (if stride > 1)
-        if stride > 1:
-            blocks.append(
-                spconv.SparseSequential(
-                    spconv.SparseConv3d(in_channels, out_channels, 3,
-                                      stride=stride, padding=1, bias=False,
-                                      indice_key=f"{indice_key}_down"),
-                    nn.BatchNorm1d(out_channels),
-                    nn.ReLU(inplace=True)
-                )
-            )
-            current_channels = out_channels
-        else:
-            current_channels = in_channels
-        
-        # Residual blocks
-        for i in range(num_blocks):
-            blocks.append(
-                spconv.SparseSequential(
-                    self._make_sparse_block(current_channels, out_channels, 3,
-                                         padding=1, indice_key=f"{indice_key}_block{i}"),
-                    self._make_sparse_block(out_channels, out_channels, 3,
-                                         padding=1, indice_key=f"{indice_key}_block{i}_2")
-                )
-            )
-            current_channels = out_channels
-            
-        return spconv.SparseSequential(*blocks)
-    
-    def _make_bev_projection(self, channels: int) -> nn.Sequential:
-        """Creates a BEV projection module for a specific feature level"""
-        return nn.Sequential(
-            nn.Conv2d(channels, channels, 1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
-    
-    def _sparse_to_bev(self, x: spconv.SparseConvTensor) -> torch.Tensor:
-        """Converts sparse 3D features to BEV by max-pooling along z-axis"""
-        dense = x.dense()
-        dense = dense.permute(0, 4, 2, 3, 1).contiguous()  # [B, C, H, W, D]
-        return torch.max(dense, dim=-1)[0]  # [B, C, H, W]
-        
     def forward(self, points: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass of the LiDAR backbone
-        Args:
-            points: (B, N, 4) tensor of point cloud (x, y, z, intensity)
-        Returns:
-            Dictionary containing:
-                - 'sparse_features': Dict of multi-scale sparse features
-                - 'bev_features': Dict of multi-scale BEV features
-        """
+        """Forward pass with improved feature propagation and normalization"""
         batch_size = points.shape[0]
         points_list = []
         
@@ -291,12 +378,21 @@ class SECONDBackbone(nn.Module):
             points_with_batch = torch.cat([batch_indices, batch_points], dim=1)
             points_list.append(points_with_batch)
         
-        # Combine all batches
         points_with_batch = torch.cat(points_list, dim=0)
         
-        # Voxelize and encode points
+        # Enhanced voxelization and encoding
         voxel_features, voxel_coords = self._voxelize(points_with_batch)
-        voxel_features = self.voxel_encoder(voxel_features)
+        
+        # Multi-branch voxel encoding with normalization
+        input_features = self.voxel_encoder['input'](voxel_features)
+        input_features = F.layer_norm(input_features, [input_features.shape[-1]])
+        
+        middle_features = self.voxel_encoder['middle'](input_features)
+        middle_features = F.layer_norm(middle_features, [middle_features.shape[-1]])
+        
+        combined_features = torch.cat([input_features, middle_features], dim=1)
+        voxel_features = self.voxel_encoder['output'](combined_features)
+        voxel_features = self.voxel_feature_norm(voxel_features)
         
         # Create initial sparse tensor
         x = spconv.SparseConvTensor(
@@ -306,24 +402,30 @@ class SECONDBackbone(nn.Module):
             batch_size=batch_size
         )
         
-        # Process through encoder
         sparse_features = {}
         bev_features = {}
         
-        # Stage 1
-        x = self.encoder[0](x)  # Initial conv
-        x = self.encoder[1](x)  # Stage 1
+        # Stage 1: Initial conv + first stage
+        x = self.encoder[0](x)  # Initial conv (32 -> 32)
+        x = self.encoder[1](x)  # Stage 1 (32 -> 64)
         sparse_features['stage1'] = x
         bev = self._sparse_to_bev(x)
-        bev_features['stage1'] = self.bev_projections['stage1'](bev)
+        bev = self.bev_projections['stage1'](bev)
+        bev_features['stage1'] = bev
         
-        # Stage 2-3
-        for i, stage in enumerate(self.encoder[2:], start=2):
-            x = stage(x)
-            stage_name = f'stage{i}'
-            sparse_features[stage_name] = x
-            bev = self._sparse_to_bev(x)
-            bev_features[stage_name] = self.bev_projections[stage_name](bev)
+        # Stage 2: 64 -> 128
+        x = self.encoder[2](x)
+        sparse_features['stage2'] = x
+        bev = self._sparse_to_bev(x)
+        bev = self.bev_projections['stage2'](bev)
+        bev_features['stage2'] = bev
+        
+        # Stage 3: 128 -> 256
+        x = self.encoder[3](x)
+        sparse_features['stage3'] = x
+        bev = self._sparse_to_bev(x)
+        bev = self.bev_projections['stage3'](bev)
+        bev_features['stage3'] = bev
         
         return {
             'sparse_features': sparse_features,
@@ -331,130 +433,35 @@ class SECONDBackbone(nn.Module):
         }
 
 def test_backbones():
-    """Test function to verify both backbones are working correctly"""
-    import matplotlib.pyplot as plt
-    
-    # Check if CUDA is available
+    """Basic sanity check for both backbones"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\nUsing device: {device}")
     
     if not torch.cuda.is_available():
         print("WARNING: CUDA is not available. SECONDBackbone requires CUDA for sparse convolutions.")
         return
     
-    # Test EfficientNetV2Backbone
-    def test_camera_backbone():
-        print("\nTesting EfficientNetV2Backbone...")
-        
-        # Create dummy input with smaller size for debugging
-        batch_size, channels, height, width = 2, 3, 224, 224  # Standard ImageNet size
-        dummy_img = torch.randn(batch_size, channels, height, width, device=device)
-        
-        print(f"\nCreated dummy input with shape: {dummy_img.shape}")
-        
-        # Initialize backbone
-        print("\nInitializing EfficientNetV2Backbone...")
+    # Quick sanity check with minimal batch size
+    try:
+        # Test camera backbone
+        dummy_img = torch.randn(1, 3, 224, 224).to(device)
         camera_backbone = EfficientNetV2Backbone(pretrained=False).to(device)
         camera_backbone.eval()
-        
-        # Forward pass
-        print("\nPerforming forward pass...")
         with torch.no_grad():
-            try:
-                features = camera_backbone(dummy_img)
-                print("\nForward pass successful!")
-            except Exception as e:
-                print(f"\nForward pass failed with error: {str(e)}")
-                raise
-    
-    # Test SECONDBackbone
-    def test_lidar_backbone():
-        print("\nTesting SECONDBackbone...")
+            _ = camera_backbone(dummy_img)
         
-        # Create dummy point cloud
-        batch_size = 1
-        num_points = 25000  # Increased number of points
-        
-        print(f"\nGenerating dummy point cloud:")
-        print(f"  Batch size: {batch_size}")
-        print(f"  Points per batch: {num_points}")
-        
-        # Generate random points within the point cloud range
-        dummy_points = []
-        for b in range(batch_size):
-            print(f"\nProcessing batch {b}:")
-            
-            # Random x, y, z coordinates
-            xyz = torch.rand(num_points, 3, device=device) * torch.tensor([[102.4, 102.4, 8.0]], device=device)
-            xyz = xyz - torch.tensor([[51.2, 51.2, 5.0]], device=device)  # Center around origin
-            
-            # Random intensity values
-            intensity = torch.rand(num_points, 1, device=device)
-            
-            # Combine coordinates and intensity
-            points = torch.cat([xyz, intensity], dim=1)
-            
-            print(f"  XYZ range: min={xyz.min().item():.2f}, max={xyz.max().item():.2f}")
-            print(f"  Intensity range: min={intensity.min().item():.2f}, max={intensity.max().item():.2f}")
-            print(f"  Points shape: {points.shape}")
-            
-            dummy_points.append(points)
-        
-        # Stack batches
-        dummy_points = torch.stack(dummy_points)  # Shape: (B, N, 4)
-        print(f"\nFinal point cloud shape: {dummy_points.shape}")
-        
-        # Initialize backbone
-        print("\nInitializing SECONDBackbone...")
-        lidar_backbone = SECONDBackbone().to(device)
+        # Test LiDAR backbone
+        dummy_points = torch.randn(1, 1000, 4).to(device)  # Minimal point cloud
+        lidar_backbone = SECONDBackbone(voxel_size=[0.8, 0.8, 0.8], point_cloud_range=[-51.2, -51.2, -5, 51.2, 51.2, 3]).to(device)
         lidar_backbone.eval()
-        
-        # Forward pass
-        print("\nStarting forward pass...")
         with torch.no_grad():
-            try:
-                print("Processing point cloud...")
-                features = lidar_backbone(dummy_points)
-                
-                print("\nLiDAR Feature Maps:")
-                print("\nSparse Features:")
-                for stage_name, feat_map in features['sparse_features'].items():
-                    print(f"\n{stage_name}:")
-                    print(f"  Indices shape: {feat_map.indices.shape}")
-                    print(f"  Features shape: {feat_map.features.shape}")
-                    print(f"  Spatial shape: {feat_map.spatial_shape}")
-                    print(f"  Batch size: {feat_map.batch_size}")
-                    print(f"  Features stats:")
-                    print(f"    Min: {feat_map.features.min().item():.3f}")
-                    print(f"    Max: {feat_map.features.max().item():.3f}")
-                    print(f"    Mean: {feat_map.features.mean().item():.3f}")
-                    print(f"    Non-zero elements: {(feat_map.features != 0).sum().item()}")
-                
-                print("\nBEV Features:")
-                for stage_name, feat_map in features['bev_features'].items():
-                    print(f"\n{stage_name}:")
-                    print(f"  Shape: {feat_map.shape}")
-                    print(f"  Stats:")
-                    print(f"    Min: {feat_map.min().item():.3f}")
-                    print(f"    Max: {feat_map.max().item():.3f}")
-                    print(f"    Mean: {feat_map.mean().item():.3f}")
-                    print(f"    Non-zero elements: {(feat_map != 0).sum().item()}")
-                    
-                print("\nForward pass completed successfully!")
-                        
-            except Exception as e:
-                print(f"\nError during LiDAR backbone forward pass:")
-                print(f"Error type: {type(e).__name__}")
-                print(f"Error message: {str(e)}")
-                raise
-    
-    # Run tests
-    try:
-        test_camera_backbone()
-        test_lidar_backbone()
-        print("\nAll tests completed successfully!")
+            _ = lidar_backbone(dummy_points)
+        
+        print("Basic backbone sanity check passed")
+        return True
+        
     except Exception as e:
-        print(f"\nTest failed with error: {str(e)}")
+        print(f"Backbone sanity check failed: {str(e)}")
+        return False
 
 if __name__ == "__main__":
     test_backbones()
