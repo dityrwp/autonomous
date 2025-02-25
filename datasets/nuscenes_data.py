@@ -8,13 +8,14 @@ from nuscenes.utils.data_classes import LidarPointCloud
 from nuscenes.map_expansion.map_api import NuScenesMap
 from pyquaternion import Quaternion
 import logging
-from shapely.geometry import Polygon, LineString, MultiPolygon, Point
+from shapely.geometry import Polygon, LineString, MultiPolygon, Point,box
 import json
 import matplotlib.pyplot as plt
 from descartes.patch import PolygonPatch
 from matplotlib.colors import ListedColormap
 from shapely.prepared import prep
 from shapely.geometry import MultiPoint
+
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -261,7 +262,7 @@ class NuScenesFilteredDataset(Dataset):
 class NuScenesBEVLabelDataset(Dataset):
     """Generates BEV segmentation labels from filtered samples."""
     
-    def __init__(self, filtered_dataset, grid_size=256, resolution=0.2):
+    def __init__(self, filtered_dataset, grid_size=128, resolution=0.2):
         self.filtered_dataset = filtered_dataset
         self.grid_size = grid_size
         self.resolution = resolution
@@ -283,11 +284,11 @@ class NuScenesBEVLabelDataset(Dataset):
         
         # Define consistent color map for visualization
         self.color_map = {
-            'background': '#000000',     # Black for background
+            'background': '#fcfcfc',     # Black for background
             'drivable_area': '#a6cee3',  # Light blue
-            'road_divider': '#b2b2b2',   # Gray
-            'lane_divider': '#fdbf6f',   # Orange
-            'walkway': '#e31a1c',        # Red
+            'road_divider': '#cab2d6',   # Gray
+            'lane_divider': '#6a3d9a',   # Orange
+            'walkway': '#e04a4c',        # Red
             'ped_crossing': '#fb9a99'    # Pink
         }
         
@@ -357,14 +358,24 @@ class NuScenesBEVLabelDataset(Dataset):
                     ego_pose = sample['ego_pose']
                     ego_x, ego_y = ego_pose['translation'][:2]
                     
-                    # Define patch box around ego vehicle (x_min, y_min, x_max, y_max)
-                    patch_size = self.grid_size * self.resolution  # Convert grid cells to meters
+                    # Define the target view space with expanded query area
+                    forward_range = 25.6  # meters ahead of ego
+                    side_range = 12.8    # meters to each side of ego
+
+                    # Expand patch box for querying (larger than view area)
+                    query_expansion = 10.0  # meters
                     patch_box = (
-                        ego_x - patch_size/2,  # x_min
-                        ego_y - patch_size/2,  # y_min
-                        ego_x + patch_size/2,  # x_max
-                        ego_y + patch_size/2   # y_max
+                        ego_pose['translation'][0] - (side_range + query_expansion),
+                        ego_pose['translation'][1] - query_expansion,  # query behind ego too
+                        ego_pose['translation'][0] + (side_range + query_expansion),
+                        ego_pose['translation'][1] + (forward_range + query_expansion)
                     )
+
+                    # Keep the target view boundaries the same for clipping
+                    x_min = -side_range
+                    x_max = side_range
+                    y_min = 0.0  # start at ego
+                    y_max = forward_range
                     
                     # Check for any map data in the patch
                     found_data = False
@@ -482,14 +493,16 @@ class NuScenesBEVLabelDataset(Dataset):
         if nusc_map is None:
             raise RuntimeError(f"Map not found for location: {location}")
         
-        # Calculate patch box and validate ego pose
+        # Define crop ratio (e.g., 0.7 means 70% of the grid is in front of the ego)
+        crop_ratio = 0.7
+        
+        # Calculate patch box based on crop ratio and shift for bottom-aligned ego
         patch_size = self.grid_size * self.resolution
-        ego_x, ego_y = ego_pose['translation'][:2]
         patch_box = (
-            ego_x - patch_size/2,
-            ego_y - patch_size/2,
-            ego_x + patch_size/2,
-            ego_y + patch_size/2
+            ego_pose['translation'][0] - patch_size/2,  # x_min (centered horizontally)
+            ego_pose['translation'][1],                 # y_min (starting from ego)
+            ego_pose['translation'][0] + patch_size/2,  # x_max
+            ego_pose['translation'][1] + patch_size     # y_max (full range in front)
         )
         
         # Get rotation matrix and heading
@@ -498,7 +511,7 @@ class NuScenesBEVLabelDataset(Dataset):
         heading_angle = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]) 
         
         # Create figure with 2 subplots
-        fig = plt.figure(figsize=(10, 8))
+        fig = plt.figure(figsize=(8, 8))
         gs = plt.GridSpec(2, 1, height_ratios=[1, 1.2])
         
         # Front camera view
@@ -556,7 +569,7 @@ class NuScenesBEVLabelDataset(Dataset):
                             line = nusc_map.extract_line(record['line_token'])
                             if not line.is_empty:
                                 # Increase buffer size for dividers to make them more visible
-                                buffer_size = 0.35 if layer_name == 'road_divider' else 0.25
+                                buffer_size = 0.25 if layer_name == 'road_divider' else 0.15
                                 polygon = line.buffer(buffer_size)
                                 if not polygon.is_empty:
                                     polygons.append(polygon)
@@ -571,47 +584,87 @@ class NuScenesBEVLabelDataset(Dataset):
                         continue
                 
                 if polygons:
-                    # Transform polygons to ego vehicle coordinates
+                    # Define the target view space with expanded query area
+                    forward_range = 25.6  # meters ahead of ego
+                    side_range = 12.8     # meters to each side of ego
+
+                    # Expand patch box for querying (larger than view area)
+                    query_expansion = 10.0  # meters
+                    patch_box = (
+                        ego_pose['translation'][0] - (side_range + query_expansion),
+                        ego_pose['translation'][1] - query_expansion,  # query behind ego too
+                        ego_pose['translation'][0] + (side_range + query_expansion),
+                        ego_pose['translation'][1] + (forward_range + query_expansion)
+                    )
+
+                    # Keep the target view boundaries the same for clipping
+                    x_min = -side_range
+                    x_max = side_range
+                    y_min = 0.0  # start at ego
+                    y_max = forward_range
+                    
                     transformed_polys = []
                     for polygon in polygons:
-                        # Translate 
+                        # Get polygon coordinates
                         poly_coords = np.array(polygon.exterior.coords)
-                        poly_coords -= np.array(ego_pose['translation'][:2])
                         
-                        # Rotate by negative heading angle
-                        # Flip heading to make ego face north
-                        theta = heading_angle - np.pi/2
+                        # 1. Transform to ego vehicle coordinate system
+                        # Translate such that ego is at (0, 0)
+                        poly_coords[:, 0] -= ego_pose['translation'][0]
+                        poly_coords[:, 1] -= ego_pose['translation'][1]
+                        
+                        # Rotate to align with ego heading
+                        theta = heading_angle -np.pi/2
                         c, s = np.cos(theta), np.sin(theta)
                         R = np.array(((c, -s), (s, c)))
                         poly_coords = np.dot(poly_coords, R)
                         
-                        transformed_polys.append(Polygon(-poly_coords))
+                        # 2. Clip polygons to target view boundaries
+                        poly = Polygon(poly_coords)
+                        target_box = box(x_min, y_min, x_max, y_max)
+                        clipped_poly = poly.intersection(target_box)
+                        
+                        if not clipped_poly.is_empty:
+                            # Handle both Polygon and MultiPolygon types
+                            if clipped_poly.geom_type == 'Polygon':
+                                # Process single polygon
+                                clipped_coords = np.array(clipped_poly.exterior.coords)
+                                
+                                # Convert to grid coordinates
+                                grid_coords = np.zeros_like(clipped_coords)
+                                grid_coords[:, 0] = (clipped_coords[:, 0] - x_min) / (x_max - x_min) * self.grid_size
+                                grid_coords[:, 1] = (y_max - clipped_coords[:, 1]) / (y_max - y_min) * self.grid_size
+                                
+                                transformed_polys.append(Polygon(grid_coords))
+                            
+                            elif clipped_poly.geom_type == 'MultiPolygon':
+                                # Process each polygon in the multipolygon
+                                for poly_part in clipped_poly.geoms:
+                                    clipped_coords = np.array(poly_part.exterior.coords)
+                                    
+                                    # Convert to grid coordinates
+                                    grid_coords = np.zeros_like(clipped_coords)
+                                    grid_coords[:, 0] = (clipped_coords[:, 0] - x_min) / (x_max - x_min) * self.grid_size
+                                    grid_coords[:, 1] = (y_max - clipped_coords[:, 1]) / (y_max - y_min) * self.grid_size
+                                    
+                                    transformed_polys.append(Polygon(grid_coords))
                     
-                    # Create grid points in BEV coordinates
-                    x = np.linspace(-self.grid_size/2, self.grid_size/2, self.grid_size)
-                    y = np.linspace(-self.grid_size/2, self.grid_size/2, self.grid_size)
+                    # Create points grid for contains test
+                    x = np.linspace(0, self.grid_size-1, self.grid_size)
+                    y = np.linspace(0, self.grid_size-1, self.grid_size)
                     grid_x, grid_y = np.meshgrid(x, y)
-                    points = np.stack((-grid_x.flatten(), grid_y.flatten()), axis=1)
+                    points = np.stack((grid_x.flatten(), grid_y.flatten()), axis=1)
                     
-                    # Scale by resolution to get BEV grid coordinates
-                    points = points * self.resolution
-                    
-                    # Test points against transformed polygons using prepared geometries
+                    # Test points against transformed polygons
                     mask = np.zeros(len(points), dtype=bool)
-                    
-                    # Convert points to list of Point objects once
                     points = [Point(p) for p in points]
                     
-                    # Union all polygons of the same class for faster contains test
                     if transformed_polys:
                         merged_poly = transformed_polys[0]
                         for poly in transformed_polys[1:]:
                             merged_poly = merged_poly.union(poly)
                         
-                        # Prepare geometry for faster contains testing
                         prepared_poly = prep(merged_poly)
-                        
-                        # Test all points at once
                         mask = np.array([prepared_poly.contains(point) for point in points])
                     
                     # Reshape mask back to grid
@@ -632,55 +685,57 @@ class NuScenesBEVLabelDataset(Dataset):
             bev_vis[mask] = rgb_color
         
         # Show composite BEV
-        ax_bev.imshow(bev_vis)  # Removed origin='lower' to match the label orientation
+        ax_bev.imshow(bev_vis)
         
-        # Draw ego vehicle in BEV (center of the grid)
-        ego_bev_x = self.grid_size // 2
-        ego_bev_y = self.grid_size // 2
-        #ax_bev.plot(ego_bev_x, ego_bev_y, 'ro', markersize=10, label='Ego Vehicle')
+        # Draw ego vehicle at the bottom center of the grid
+        ego_bev_x = self.grid_size // 2  # Center X
+        ego_bev_y = self.grid_size - 10   # Near bottom Y (10 pixels from bottom)
         
-        # Draw ego vehicle heading in BEV (pointing up)
-        # heading_length = 20  # pixels
-        # ax_bev.arrow(ego_bev_x, ego_bev_y, 
-        #             0, -heading_length,  # Point up in BEV
-        #             head_width=5, head_length=5, fc='r', ec='r')
+        # Draw ego vehicle as a triangle pointing upward
+        triangle_height = 15
+        triangle_width = 10
+        triangle = plt.Polygon([
+            [ego_bev_x, ego_bev_y - triangle_height],  # Top point
+            [ego_bev_x - triangle_width/2, ego_bev_y],  # Bottom left
+            [ego_bev_x + triangle_width/2, ego_bev_y]   # Bottom right
+        ], color='red', alpha=1.0, label='Ego Vehicle')
+        ax_bev.add_patch(triangle)
         
-        # # Add distance markers in BEV
-        # for dist in [5, 10, 15, 20, 25]:
-        #     pixels = dist / self.resolution
-        #     circle = plt.Circle((ego_bev_x, ego_bev_y), pixels, 
-        #                       color='gray', fill=False, linestyle='--', alpha=0.3)
-        #     ax_bev.add_patch(circle)
-        #     ax_bev.text(ego_bev_x + pixels, ego_bev_y, f'{dist}m', 
-        #                color='gray', alpha=0.5)
+        # Add distance markers in front of ego (semicircles)
+        for dist in [10, 20, 30, 40]:  # distances in meters
+            pixels = dist / self.resolution
+            # Draw only the front half of the circle
+            circle = plt.matplotlib.patches.Arc(
+                (ego_bev_x, ego_bev_y), 
+                pixels * 2, pixels * 2,  # width, height
+                theta1=180, theta2=360,  # Draw only top half
+                color='gray', linestyle='--', alpha=0.3)
+            ax_bev.add_patch(circle)
+            # Add distance label
+            ax_bev.text(
+                ego_bev_x, ego_bev_y - pixels, 
+                f'{dist}m', 
+                horizontalalignment='center',
+                color='gray', alpha=0.5
+            )
         
-        # # Add coordinate axes in BEV
-        # ax_bev.axhline(y=ego_bev_y, color='gray', linestyle='--', alpha=0.3)
-        # ax_bev.axvline(x=ego_bev_x, color='gray', linestyle='--', alpha=0.3)
+        # Add coordinate axes labels
+        ax_bev.set_xlabel("Lateral Distance (meters)")
+        ax_bev.set_ylabel("Forward Distance (meters)")
         
-        # Add grid markers in meters
-        meter_ticks = np.arange(-25, 26, 5)
-        pixel_ticks = meter_ticks / self.resolution + self.grid_size // 2
-        ax_bev.set_xticks(pixel_ticks[::2])  # Show every other tick to avoid crowding
-        ax_bev.set_yticks(pixel_ticks[::2])
-        ax_bev.set_xticklabels([f'{x}m' for x in meter_ticks[::2]])
-        ax_bev.set_yticklabels([f'{y}m' for y in meter_ticks[::2]])
+        # Adjust tick labels to show distances relative to ego vehicle
+        meter_ticks_x = np.arange(-25, 26, 5)
+        meter_ticks_y = np.arange(0, 51, 5)  # Only positive distances for forward view
+        pixel_ticks_x = meter_ticks_x / self.resolution + self.grid_size // 2
+        pixel_ticks_y = self.grid_size - (meter_ticks_y / self.resolution)
         
-        # Set axis properties
-        ax_bev.set_aspect('equal')
-        ax_bev.grid(True, alpha=0.3)
-        ax_bev.set_xlabel("BEV Grid X (meters)")
-        ax_bev.set_ylabel("BEV Grid Y (meters)")
+        ax_bev.set_xticks(pixel_ticks_x[::2])
+        ax_bev.set_yticks(pixel_ticks_y[::2])
+        ax_bev.set_xticklabels([f'{x}m' for x in meter_ticks_x[::2]])
+        ax_bev.set_yticklabels([f'{y}m' for y in meter_ticks_y[::2]])
         
-        # Add colorbar
-        cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-        colors = [self.rgb_colors[name] for name in self.class_map.keys()]
-        cmap = ListedColormap(colors)
-        norm = plt.Normalize(vmin=0, vmax=len(self.class_map)-1)
-        cbar = plt.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), cax=cbar_ax)
-        cbar.set_ticks(np.arange(len(self.class_map)) + 0.5)
-        cbar.set_ticklabels(list(self.class_map.keys()))
-        cbar.ax.tick_params(labelsize=8)
+        # Add legend
+        ax_bev.legend()
         
         plt.tight_layout()
         plt.savefig(f"bev_debug_{sample_token}.png", dpi=300, bbox_inches='tight')
