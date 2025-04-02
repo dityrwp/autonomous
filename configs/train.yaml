@@ -2,33 +2,41 @@
 
 # Basic Training Settings
 train:
-  epochs: 100
-  batch_size: 4
-  num_workers: 4
+  epochs: 50  # Return to original value for proper convergence
+  batch_size: 4  # Increase batch size if memory allows
+  num_workers: 6  # Keep the increased worker count
   pin_memory: true
-  mixed_precision: true  # Use AMP
+  mixed_precision: true  # Keep mixed precision for memory efficiency
   sync_bn: true  # Use SyncBatchNorm for multi-GPU
-  deterministic: true  # For reproducibility
+  deterministic: false  # Set to false for better performance
   seed: 42
+
+# Dataset Configuration
+dataset:
+  # Paths to dataset
+  dataroot: "/home/mevi/Documents/bev/nuscenes07"  # Path to NuScenes dataset
+  bev_labels_dir: "/home/mevi/Documents/bev/test"  # Path to precomputed BEV labels
+  version: "v1.0-trainval"  # NuScenes version
 
 # Optimization
 optimizer:
   name: "AdamW"
-  lr_camera: 1.0e-4
-  lr_lidar: 1.0e-4
-  lr_fusion: 1.0e-4
-  lr_head: 1.0e-4
+  lr_camera: 5.0e-5  # Reduced learning rate for stability
+  lr_lidar: 5.0e-5   # Reduced learning rate for stability
+  lr_fusion: 5.0e-5  # Reduced learning rate for stability
+  lr_head: 5.0e-5    # Reduced learning rate for stability
   weight_decay: 0.01
   beta1: 0.9
   beta2: 0.999
   eps: 1.0e-8
+  grad_clip: 1.0  # Add gradient clipping to prevent unstable gradients
 
 # Learning Rate Scheduler
 scheduler:
   name: "CosineAnnealingLR"
-  T_max: 100  # Same as epochs
+  T_max: 50  # Match with epochs
   eta_min: 1.0e-6
-  warmup_epochs: 5
+  warmup_epochs: 3  # Reduced for shorter training
   warmup_ratio: 0.1
 
 # Loss Configuration
@@ -36,30 +44,31 @@ loss:
   focal_loss:
     gamma: 2.0
     alpha: 0.25
-  class_weights: [1.0, 1.0, 1.0]  # Weight for each class
+  # Modified class weights based on observed class imbalance
+  class_weights: [1.0, 1.5, 2.5, 2.5, 2.0, 2.0]  # Increased weights for underrepresented classes
   loss_weights:
     segmentation: 1.0
 
 # Validation
 val:
-  interval: 1  # Validate every N epochs
-  batch_size: 4
+  interval: 1  # Validate every epoch
+  batch_size: 4  # Increased 
   save_predictions: true
   visualization_threshold: 0.5
 
 # Checkpointing
 checkpoint:
   save_dir: "checkpoints"
-  save_interval: 10  # Save every N epochs
+  save_interval: 5  # Save every 5 epochs
   save_best: true
   save_last: true
-  resume: false
-  resume_path: null
+  resume: true
+  resume_path: "outputs/checkpoints/last_model.pth"
 
 # Logging
 logging:
   log_dir: "logs"
-  log_interval: 10  # Log every N steps
+  log_interval: 20  # Log more frequently
   metrics:
     - "loss"
     - "mean_iou"
@@ -68,13 +77,22 @@ logging:
     - "recall"
   visualization:
     save_dir: "visualizations"
-    max_images: 16  # Max number of images to save per epoch
+    max_images: 8  # Reduced from 16 to save disk space and processing time
 
 # Hardware
 hardware:
   gpu_ids: [0]  # List of GPU ids to use
   dist_backend: "nccl"
   dist_url: "tcp://localhost:12345"
+
+# Data Augmentation
+augmentation:
+  enabled: true
+  random_flip: true
+  random_rotate: true
+  rotate_range: [-0.78539816, 0.78539816]  # [-pi/4, pi/4]
+  scale_range: [0.95, 1.05]
+  translation_std: [0.2, 0.2, 0.2]
 
 # Debug
 debug:

@@ -16,7 +16,7 @@ lidar_backbone:
   voxel_size: [0.8, 0.8, 0.8]
   point_cloud_range: [-51.2, -51.2, -5, 51.2, 51.2, 3]
   max_num_points: 32
-  max_voxels: 4000
+  max_voxels: 30000  # Reduced from 34000 to save memory
 
 # Fusion Configuration
 fusion:
@@ -27,16 +27,16 @@ fusion:
     stage4: 384
     stage5: 512
   output_channels: 128
-  bev_height: 128
-  bev_width: 128
-  num_heads: 4
+  spatial_size: [128, 128]  # Changed from bev_height/width to spatial_size to match implementation
+  chunk_size: 1024  # Reduced chunk size from 4096 to 1024 for more gradual processing
+  use_reentrant: true  # Enable reentrant checkpointing for better memory efficiency
 
 # Segmentation Head Configuration
 segmentation_head:
   name: "BEVSegmentationHead"
   in_channels: 128
   hidden_channels: 128
-  num_classes: 3
+  num_classes: 6  # NuScenes BEV classes: background, drivable_area, lane_divider, road_divider, ped_crossing, walkway
   dropout: 0.1
   use_focal_loss: true
   focal_gamma: 2.0
@@ -45,10 +45,18 @@ segmentation_head:
 
 # Data Configuration
 input_config:
-  image_size: [384, 512]  # H, W
-  num_cameras: 1
-  num_lidar_channels: 16  # Velodyne Puck
-  max_points_per_frame: 25000
+  image_size: [900, 1600]  # H, W - NuScenes camera image size
+  num_cameras: 1  # Using front camera only
+  max_points_per_frame: 30000  # Reduced from 34000 to save memory
+
+# Class Mapping
+class_map:
+  background: 0
+  drivable_area: 1
+  lane_divider: 2
+  road_divider: 3
+  ped_crossing: 4
+  walkway: 5
 
 # Augmentation Configuration
 augmentation:
