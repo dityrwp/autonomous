@@ -409,30 +409,7 @@ class NuScenesBEVLabelDataset(Dataset):
                 logging.warning(f"Error validating sample {idx}: {str(e)}")
                 continue
         
-        # Log statistics
-        total_samples = len(self.filtered_dataset)
-        valid_samples = len(self.valid_samples)
-        logging.info(f"\nDataset Statistics:")
-        logging.info(f"Total samples: {total_samples}")
-        logging.info(f"Valid samples: {valid_samples} ({valid_samples/total_samples*100:.1f}%)")
-        logging.info("\nSamples by location:")
-        for loc in location_counts:
-            valid = valid_samples_by_location.get(loc, 0)
-            total = location_counts[loc]
-            logging.info(f"{loc}: {valid}/{total} valid ({valid/total*100:.1f}%)")
-        
         if not self.valid_samples:
-            # Provide detailed error message
-            logging.error("\nMap loading summary:")
-            logging.error(f"Total locations in dataset: {len(location_counts)}")
-            logging.error(f"Successfully loaded maps: {len(self.map_cache)}")
-            logging.error("\nAvailable locations:")
-            for location in location_counts:
-                logging.error(f"  {location}")
-            logging.error("\nLoaded maps:")
-            for location in self.map_cache:
-                logging.error(f"  {location}")
-            
             raise RuntimeError(
                 "No valid samples found with map data! Please check:\n"
                 "1. Map files exist in the correct location\n"
@@ -456,7 +433,7 @@ class NuScenesBEVLabelDataset(Dataset):
             sample_token = sample['sample_token']
             ego_pose = sample['ego_pose']
             
-            bev_label = self._generate_bev_label(sample_token, ego_pose)
+            bev_label = self._generate_bev_label(sample_token, ego_pose, debug=False)
             
             return {
                 'bev_label': torch.from_numpy(bev_label).long(),
@@ -467,13 +444,17 @@ class NuScenesBEVLabelDataset(Dataset):
             logging.error(f"Error generating BEV label for sample {sample_token}: {e}")
             raise
 
-    def box_to_polygon(self, box):
-        """Convert box coordinates to Shapely Polygon."""
-        xmin, ymin, xmax, ymax = box
-        return Polygon([(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)])
-
-    def _generate_bev_label(self, sample_token, ego_pose):
-        """Generate BEV segmentation label by direct rasterization from map."""
+    def _generate_bev_label(self, sample_token, ego_pose, debug=False):
+        """Generate BEV segmentation label by direct rasterization from map.
+        
+        Args:
+            sample_token: NuScenes sample token
+            ego_pose: Ego vehicle pose dictionary
+            debug: If True, save visualization of the BEV label
+        
+        Returns:
+            bev_grid: Grid of class IDs for BEV segmentation (shape: grid_size x grid_size)
+        """
         # Initialize label with background class
         label = np.zeros((self.grid_size, self.grid_size), dtype=np.uint8)  # Will be class 0 (background)
         
@@ -482,11 +463,6 @@ class NuScenesBEVLabelDataset(Dataset):
         scene = self.nusc.get('scene', sample['scene_token'])
         log = self.nusc.get('log', scene['log_token'])
         location = log['location']
-        
-        # Get front camera image for validation
-        cam_token = sample['data']['CAM_FRONT']
-        cam_data = self.nusc.get('sample_data', cam_token)
-        cam_path = os.path.join(self.nusc.dataroot, cam_data['filename'])
         
         # Get map and validate
         nusc_map = self.map_cache.get(location)
@@ -510,21 +486,28 @@ class NuScenesBEVLabelDataset(Dataset):
         # Calculate heading angle (front is positive x-axis in vehicle frame)
         heading_angle = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]) 
         
-        # Create figure with 2 subplots
-        fig = plt.figure(figsize=(8, 8))
-        gs = plt.GridSpec(2, 1, height_ratios=[1, 1.2])
-        
-        # Front camera view
-        ax_cam = fig.add_subplot(gs[0])
-        ax_cam.set_title("Front Camera View")
-        if os.path.exists(cam_path):
-            img = plt.imread(cam_path)
-            ax_cam.imshow(img)
-        ax_cam.axis('off')
-        
-        # BEV grid view
-        ax_bev = fig.add_subplot(gs[1])
-        ax_bev.set_title(f"BEV Grid View ({self.grid_size}x{self.grid_size} @ {self.resolution}m/pixel)")
+        # Initialize visualization if in debug mode
+        if debug:
+            # Get front camera image for validation
+            cam_token = sample['data']['CAM_FRONT']
+            cam_data = self.nusc.get('sample_data', cam_token)
+            cam_path = os.path.join(self.nusc.dataroot, cam_data['filename'])
+            
+            # Create figure with 2 subplots
+            fig = plt.figure(figsize=(8, 8))
+            gs = plt.GridSpec(2, 1, height_ratios=[1, 1.2])
+            
+            # Front camera view
+            ax_cam = fig.add_subplot(gs[0])
+            ax_cam.set_title("Front Camera View")
+            if os.path.exists(cam_path):
+                img = plt.imread(cam_path)
+                ax_cam.imshow(img)
+            ax_cam.axis('off')
+            
+            # BEV grid view
+            ax_bev = fig.add_subplot(gs[1])
+            ax_bev.set_title(f"BEV Grid View ({self.grid_size}x{self.grid_size} @ {self.resolution}m/pixel)")
         
         # Define rendering order (from bottom to top)
         layer_order = [
@@ -675,182 +658,22 @@ class NuScenesBEVLabelDataset(Dataset):
                 logging.error(f"Error processing layer {layer_name}: {str(e)}")
                 continue
         
-        # Convert class IDs to RGB colors for visualization
-        bev_vis = np.zeros((self.grid_size, self.grid_size, 3), dtype=np.uint8)
-        for class_name, class_id in self.class_map.items():
-            mask = (bev_grid == class_id)
-            # Convert hex color to RGB values
-            hex_color = self.color_map[class_name].lstrip('#')
-            rgb_color = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-            bev_vis[mask] = rgb_color
-        
-        # Show composite BEV
-        ax_bev.imshow(bev_vis)
-        
-        # Draw ego vehicle at the bottom center of the grid
-        ego_bev_x = self.grid_size // 2  # Center X
-        ego_bev_y = self.grid_size - 10   # Near bottom Y (10 pixels from bottom)
-        
-        # Draw ego vehicle as a triangle pointing upward
-        triangle_height = 15
-        triangle_width = 10
-        triangle = plt.Polygon([
-            [ego_bev_x, ego_bev_y - triangle_height],  # Top point
-            [ego_bev_x - triangle_width/2, ego_bev_y],  # Bottom left
-            [ego_bev_x + triangle_width/2, ego_bev_y]   # Bottom right
-        ], color='red', alpha=1.0, label='Ego Vehicle')
-        ax_bev.add_patch(triangle)
-        
-        # Add distance markers in front of ego (semicircles)
-        for dist in [10, 20, 30, 40]:  # distances in meters
-            pixels = dist / self.resolution
-            # Draw only the front half of the circle
-            circle = plt.matplotlib.patches.Arc(
-                (ego_bev_x, ego_bev_y), 
-                pixels * 2, pixels * 2,  # width, height
-                theta1=180, theta2=360,  # Draw only top half
-                color='gray', linestyle='--', alpha=0.3)
-            ax_bev.add_patch(circle)
-            # Add distance label
-            ax_bev.text(
-                ego_bev_x, ego_bev_y - pixels, 
-                f'{dist}m', 
-                horizontalalignment='center',
-                color='gray', alpha=0.5
-            )
-        
-        # Add coordinate axes labels
-        ax_bev.set_xlabel("Lateral Distance (meters)")
-        ax_bev.set_ylabel("Forward Distance (meters)")
-        
-        # Adjust tick labels to show distances relative to ego vehicle
-        meter_ticks_x = np.arange(-25, 26, 5)
-        meter_ticks_y = np.arange(0, 51, 5)  # Only positive distances for forward view
-        pixel_ticks_x = meter_ticks_x / self.resolution + self.grid_size // 2
-        pixel_ticks_y = self.grid_size - (meter_ticks_y / self.resolution)
-        
-        ax_bev.set_xticks(pixel_ticks_x[::2])
-        ax_bev.set_yticks(pixel_ticks_y[::2])
-        ax_bev.set_xticklabels([f'{x}m' for x in meter_ticks_x[::2]])
-        ax_bev.set_yticklabels([f'{y}m' for y in meter_ticks_y[::2]])
-        
-        # Add legend
-        ax_bev.legend()
-        
-        plt.tight_layout()
-        plt.savefig(f"bev_debug_{sample_token}.png", dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        return bev_grid  # Return class IDs for training
-
-    def _world_to_grid(self, coords, ego_pose):
-        """Transforms world coordinates to BEV grid indices."""
-        # Get rotation matrix from quaternion (only 2x2 part for 2D rotation)
-        rotation = Quaternion(ego_pose['rotation']).rotation_matrix[:2, :2]
-        translation = np.array(ego_pose['translation'][:2])
-
-        # Debug prints for transformation components - only print first point as example
-        logging.info(f"Sample coordinate transformation:")
-        logging.info(f"- Original first point: {coords[0]}")
-        
-        # 1. Center coordinates at ego vehicle position
-        coords_centered = coords[:, :2] - translation
-        logging.info(f"- After centering: {coords_centered[0]}")
-        
-        # 2. Rotate coordinates to align with ego vehicle orientation
-        coords_rotated = np.dot(rotation, coords_centered.T).T
-        logging.info(f"- After rotation: {coords_rotated[0]}")
-        
-        # 3. Scale to grid resolution and shift to center of grid
-        grid_coords = (coords_rotated / self.resolution + self.grid_size/2).astype(int)
-        logging.info(f"- Final grid coords: {grid_coords[0]}")
-        
-        # Clip coordinates to grid bounds
-        grid_coords = np.clip(grid_coords, 0, self.grid_size - 1)
-        
-        # Print summary statistics instead of all coordinates
-        logging.info(f"Coordinate ranges:")
-        logging.info(f"- X range: [{grid_coords[:, 0].min()}, {grid_coords[:, 0].max()}]")
-        logging.info(f"- Y range: [{grid_coords[:, 1].min()}, {grid_coords[:, 1].max()}]")
-        
-        return grid_coords
-
-    def _fill_polygon(self, coords, label, class_id):
-        """Fills polygons in the BEV grid."""
-        try:
-            from matplotlib.path import Path
-            grid_x, grid_y = np.meshgrid(np.arange(self.grid_size), np.arange(self.grid_size))
-            points = np.vstack((grid_x.ravel(), grid_y.ravel())).T
+        # Create and save visualization if in debug mode
+        if debug:
+            # Convert class IDs to RGB colors for visualization
+            bev_vis = np.zeros((self.grid_size, self.grid_size, 3), dtype=np.uint8)
+            for class_name, class_id in self.class_map.items():
+                mask = (bev_grid == class_id)
+                # Convert hex color to RGB values
+                hex_color = self.color_map[class_name].lstrip('#')
+                rgb_color = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+                bev_vis[mask] = rgb_color
             
-            path = Path(coords)
-            mask = path.contains_points(points)
-            mask = mask.reshape(self.grid_size, self.grid_size)
-            label[mask] = class_id
-        except Exception as e:
-            logging.warning(f"Error filling polygon: {e}")
-
-    def _draw_line(self, coords, label, class_id):
-        """Draws lines in the BEV grid."""
-        try:
-            from skimage.draw import line
-            for i in range(len(coords) - 1):
-                start = coords[i]
-                end = coords[i + 1]
-                
-                # Skip if either point is outside the grid
-                if not (0 <= start[0] < self.grid_size and 0 <= start[1] < self.grid_size and
-                       0 <= end[0] < self.grid_size and 0 <= end[1] < self.grid_size):
-                    continue
-                
-                # Draw the line
-                rr, cc = line(int(start[1]), int(start[0]), int(end[1]), int(end[0]))
-                
-                # Filter points within grid bounds
-                valid = (rr >= 0) & (rr < self.grid_size) & (cc >= 0) & (cc < self.grid_size)
-                label[rr[valid], cc[valid]] = class_id
-                
-                # # Draw thicker line by adding adjacent pixels
-                # for offset in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
-                #     rr_offset = rr[valid] + offset[0]
-                #     cc_offset = cc[valid] + offset[1]
-                #     valid_offset = (rr_offset >= 0) & (rr_offset < self.grid_size) & \
-                #                  (cc_offset >= 0) & (cc_offset < self.grid_size)
-                #     label[rr_offset[valid_offset], cc_offset[valid_offset]] = class_id
-                
-        except Exception as e:
-            logging.warning(f"Error drawing line: {e}")
-            return
-
-    def _verify_map_data(self, location, nusc_map):
-        """Verify that map data exists and is accessible."""
-        # Test different areas of the map
-        test_boxes = [
-            (-100, -100, 100, 100),  # Center
-            (0, 0, 200, 200),        # Positive quadrant
-            (-200, -200, 0, 0)       # Negative quadrant
-        ]
-        
-        for test_box in test_boxes:
-            for layer in ['drivable_area', 'lane']:  # Removed road_segment
-                records = nusc_map.get_records_in_patch(test_box, layer_names=[layer])
-                if len(records[layer]) > 0:
-                    logging.info(f"Found {len(records[layer])} {layer} records in {location}")
-                    return True
-        
-        return False
-
-    def run_all_tests(self):
-        """Run all validation tests"""
-        try:
-            print("\nRunning validation tests for trainval dataset...")
-            # self.test_calibration()
-            # self.test_data_loading()
-            self.test_bev_visualization()
-            self.test_coordinate_mapping()
-            self.test_map_statistics()
-            # self.test_dataloader()
-            print("\nAll validation tests completed successfully!")
+            # Show composite BEV
+            ax_bev.imshow(bev_vis)
             
-        except Exception as e:
-            logging.error(f"Validation failed: {e}")
-            raise 
+            # Save visualization
+            plt.savefig(f"bev_debug_{sample_token}.png", dpi=300, bbox_inches='tight')
+            plt.close()
+                
+        return bev_grid  # Return class IDs for training 
