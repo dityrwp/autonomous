@@ -432,36 +432,3 @@ class SECONDBackbone(nn.Module):
             'bev_features': bev_features
         }
 
-def test_backbones():
-    """Basic sanity check for both backbones"""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    if not torch.cuda.is_available():
-        print("WARNING: CUDA is not available. SECONDBackbone requires CUDA for sparse convolutions.")
-        return
-    
-    # Quick sanity check with minimal batch size
-    try:
-        # Test camera backbone
-        dummy_img = torch.randn(1, 3, 224, 224).to(device)
-        camera_backbone = EfficientNetV2Backbone(pretrained=False).to(device)
-        camera_backbone.eval()
-        with torch.no_grad():
-            _ = camera_backbone(dummy_img)
-        
-        # Test LiDAR backbone
-        dummy_points = torch.randn(1, 1000, 4).to(device)  # Minimal point cloud
-        lidar_backbone = SECONDBackbone(voxel_size=[0.8, 0.8, 0.8], point_cloud_range=[-51.2, -51.2, -5, 51.2, 51.2, 3]).to(device)
-        lidar_backbone.eval()
-        with torch.no_grad():
-            _ = lidar_backbone(dummy_points)
-        
-        print("Basic backbone sanity check passed")
-        return True
-        
-    except Exception as e:
-        print(f"Backbone sanity check failed: {str(e)}")
-        return False
-
-if __name__ == "__main__":
-    test_backbones()

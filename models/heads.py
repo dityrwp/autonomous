@@ -60,13 +60,16 @@ class BEVSegmentationHead(nn.Module):
         use_focal_loss: bool = True,
         focal_gamma: float = 2.0,
         learnable_alpha: bool = True,
-        initial_alpha: float = 0.25
+        initial_alpha: float = 0.25,
+        class_weights: Optional[List[float]] = None,
+        use_dynamic_weighting: bool = True
     ) -> None:
         super().__init__()
         
         self.num_classes = num_classes
         self.use_focal_loss = use_focal_loss
         self.focal_gamma = focal_gamma
+        self.dropout = dropout
         
         # Learnable class weights for focal loss
         if learnable_alpha:
@@ -79,8 +82,27 @@ class BEVSegmentationHead(nn.Module):
                 'focal_alpha',
                 torch.full((num_classes,), initial_alpha)
             )
+            
+        # Class weights for addressing imbalance
+        if class_weights is not None:
+            self.register_buffer(
+                'class_weights',
+                torch.tensor(class_weights, dtype=torch.float32)
+            )
+        else:
+            # Default: inverse frequency weights (to be updated during training)
+            self.register_buffer(
+                'class_weights', 
+                torch.ones(num_classes, dtype=torch.float32)
+            )
         
-        # Optimized feature processing
+        # Dynamic class weighting based on frequency
+        self.use_dynamic_weighting = use_dynamic_weighting
+        self.class_count = torch.zeros(num_classes)
+        self.total_pixels = 0
+        self.ema_factor = 0.99  # Exponential moving average factor
+        
+        # Optimized feature processing with more dropout for regularization
         self.features = nn.Sequential(
             # Spatial context with grouped 3x3
             nn.Conv2d(in_channels, hidden_channels, 3, 
@@ -93,7 +115,7 @@ class BEVSegmentationHead(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, 1, bias=False),
             nn.BatchNorm2d(hidden_channels),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout)
+            nn.Dropout2d(dropout * 1.5),  # Increased dropout for regularization
         )
         
         # Class prediction (keep in fp32 for stability)
@@ -106,6 +128,11 @@ class BEVSegmentationHead(nn.Module):
         self.register_buffer('running_mean_preds', 
                            torch.zeros(num_classes))
         self.register_buffer('running_count', torch.tensor(0))
+        
+        # Track class distribution for dynamic class weight adjustment
+        self.register_buffer('class_distribution', 
+                           torch.zeros(num_classes))
+        self.register_buffer('samples_seen', torch.tensor(0))
     
     def _init_weights(self) -> None:
         for m in self.modules():
@@ -121,7 +148,44 @@ class BEVSegmentationHead(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
     
-    @torch.cuda.amp.autocast()
+    def update_class_weights(self, targets):
+        """Update class weights based on observed class frequencies"""
+        if not self.use_dynamic_weighting:
+            return
+        
+        # Count class occurrences in this batch
+        batch_counts = torch.zeros(self.num_classes, device=targets.device)
+        
+        if targets.dim() == 4 and targets.size(1) > 1:  # One-hot encoded
+            batch_counts = targets.sum(dim=(0, 2, 3))
+        else:  # Class indices
+            if targets.dim() == 4:
+                targets = targets.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
+            for c in range(self.num_classes):
+                batch_counts[c] = (targets == c).sum()
+        
+        # Update total counts with EMA
+        total_pixels = batch_counts.sum()
+        if self.total_pixels == 0:  # First batch
+            self.class_count = batch_counts.float().to(self.class_count.device)
+            self.total_pixels = total_pixels.to(self.class_count.device)
+        else:
+            self.class_count = self.ema_factor * self.class_count + (1 - self.ema_factor) * batch_counts.float().to(self.class_count.device)
+            self.total_pixels = self.ema_factor * self.total_pixels + (1 - self.ema_factor) * total_pixels.to(self.class_count.device)
+        
+        # Calculate class frequencies
+        class_freq = self.class_count / max(self.total_pixels, 1)
+        
+        # Inverse frequency weighting with smoothing to prevent extreme values
+        smoothed_weights = 1.0 / (class_freq + 0.05)
+        
+        # Normalize weights to mean of 1.0
+        smoothed_weights = smoothed_weights * (self.num_classes / smoothed_weights.sum())
+        
+        # Clamp weights to reasonable range
+        self.class_weights = smoothed_weights.clamp(0.5, 3.0)
+    
+    @torch.amp.autocast(device_type='cuda')
     def forward(
         self,
         x: torch.Tensor,
@@ -144,8 +208,29 @@ class BEVSegmentationHead(nn.Module):
                 ) / (self.running_count + 1)
                 self.running_count += 1
         
-        if self.training and targets is not None:
+        if targets is not None:
             losses = {}
+            
+            # Convert targets to one-hot format if they are class indices
+            if targets.dim() == 3 or (targets.dim() == 4 and targets.size(1) == 1):
+                # Handle both [B, H, W] and [B, 1, H, W] formats
+                if targets.dim() == 4:
+                    targets = targets.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
+                
+                # Convert class indices to one-hot
+                one_hot_targets = torch.zeros(
+                    (targets.size(0), self.num_classes, targets.size(1), targets.size(2)),
+                    dtype=torch.float32,
+                    device=targets.device
+                )
+                for c in range(self.num_classes):
+                    one_hot_targets[:, c] = (targets == c).float()
+                targets = one_hot_targets
+            
+            # Update class weights if using dynamic weighting
+            if self.use_dynamic_weighting:
+                with torch.no_grad():
+                    self.update_class_weights(targets)
             
             # Debug info
             with torch.no_grad():
@@ -153,27 +238,64 @@ class BEVSegmentationHead(nn.Module):
                 for i in range(self.num_classes):
                     losses[f'class_{i}_mean'] = batch_means[i].item()
                     losses[f'class_{i}_running_mean'] = self.running_mean_preds[i].item()
+                    losses[f'class_{i}_weight'] = self.class_weights[i].item()
             
-            # Compute loss for each class
-            total_loss = 0
-            for i in range(self.num_classes):
-                if self.use_focal_loss:
-                    loss = sigmoid_focal_loss(
-                        logits[:, i:i+1],
-                        targets[:, i:i+1],
-                        alpha=self.focal_alpha[i].item(),
-                        gamma=self.focal_gamma
-                    )
-                else:
-                    loss = F.binary_cross_entropy_with_logits(
-                        logits[:, i:i+1],
-                        targets[:, i:i+1],
-                        reduction='mean'
-                    )
-                losses[f'class_{i}_loss'] = loss.item()  # Store float for logging
-                total_loss += loss
+            # Use simplified focal loss calculation to avoid negative values
+            if self.use_focal_loss:
+                # Base binary cross entropy loss
+                bce_loss = F.binary_cross_entropy_with_logits(
+                    logits, targets, reduction='none'
+                )
+                
+                # Get probabilities for focal weight calculation
+                p = torch.sigmoid(logits)
+                pt = p * targets + (1 - p) * (1 - targets)
+                
+                # Apply focal loss scaling (avoid potential numerical issues)
+                focal_weight = torch.pow((1 - pt).clamp(min=1e-7), self.focal_gamma)
+                
+                # Apply class weights
+                class_weights = self.class_weights.to(bce_loss.device)
+                class_weight_map = torch.zeros_like(targets)
+                for c in range(self.num_classes):
+                    class_weight_map[:, c] = class_weights[c]
+                
+                # Calculate alpha weights for pos/neg samples
+                alpha_weights = self.focal_alpha.to(bce_loss.device)
+                alpha_weight_map = torch.zeros_like(targets)
+                for c in range(self.num_classes):
+                    alpha_weight_map[:, c] = alpha_weights[c]
+                
+                # Combine all weighting factors
+                weighted_loss = bce_loss * focal_weight * class_weight_map
+                pos_loss = alpha_weight_map * targets * weighted_loss
+                neg_loss = (1 - alpha_weight_map) * (1 - targets) * weighted_loss
+                
+                # Final loss with guaranteed positive values
+                total_loss = (pos_loss + neg_loss).mean()
+                
+                # Extra safety: ensure loss is strictly positive (should never happen with correct implementation)
+                if total_loss < 0:
+                    print(f"WARNING: Negative loss detected before clamping: {total_loss.item()}")
+                    total_loss = torch.clamp(total_loss, min=0.0)
+                
+                losses['total_loss'] = total_loss
+                
+                # Add detailed diagnostics for debugging
+                with torch.no_grad():
+                    losses['bce_raw'] = bce_loss.mean().item()
+                    losses['focal_weight_mean'] = focal_weight.mean().item()
+                    losses['focal_weight_min'] = focal_weight.min().item()
+                    losses['focal_weight_max'] = focal_weight.max().item()
+                    losses['pt_min'] = pt.min().item()
+                    losses['pt_max'] = pt.max().item()
+            else:
+                # Standard CE with class weights
+                class_weights = self.class_weights.to(logits.device)
+                loss = F.cross_entropy(logits, targets.argmax(dim=1) if targets.dim() == 4 else targets, 
+                                      weight=class_weights)
+                losses['total_loss'] = loss
             
-            losses['total_loss'] = total_loss
             return losses
         
         else:
