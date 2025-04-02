@@ -38,80 +38,50 @@ class SegmentationMetrics:
             targets: [B, C, H, W] binary ground truth or [B, H, W] class indices
             threshold: Classification threshold for predictions
         """
-        print(f"SegmentationMetrics.update called with:")
-        print(f"  predictions shape: {predictions.shape}")
-        print(f"  targets shape: {targets.shape}")
-        print(f"  predictions type: {predictions.dtype}")
-        print(f"  targets type: {targets.dtype}")
-        print(f"  num_classes: {self.num_classes}")
+        # Print shapes for debugging
+        print(f"  SegmentationMetrics.update input shapes: predictions {predictions.shape}, targets {targets.shape}")
         
         # Handle case where targets are class indices [B, H, W] instead of one-hot [B, C, H, W]
         if targets.dim() == 3 and predictions.dim() == 4:
-            print("  Case: targets are class indices [B, H, W]")
-            # Convert class indices to one-hot encoding
-            B, H, W = targets.shape
-            C = predictions.shape[1]
-            
-            # Check class distribution in targets
-            target_counts = []
-            for c in range(self.num_classes):
-                count = (targets == c).sum().item()
-                target_counts.append(count)
-                print(f"  Class {c} count in targets: {count} ({count/(B*H*W)*100:.2f}%)")
-            
-            # Get predicted class indices
+            # Convert predictions to class indices if they're probabilities
             pred_classes = predictions.argmax(dim=1)  # [B, H, W]
-            print(f"  pred_classes shape: {pred_classes.shape}")
-            print(f"  pred_classes min/max: {pred_classes.min().item()}/{pred_classes.max().item()}")
-            
-            # Check class distribution in predictions
-            pred_counts = []
-            for c in range(self.num_classes):
-                count = (pred_classes == c).sum().item()
-                pred_counts.append(count)
-                print(f"  Class {c} count in predictions: {count} ({count/(B*H*W)*100:.2f}%)")
             
             # Flatten both tensors for confusion matrix calculation
-            pred_flat = pred_classes.reshape(-1).cpu()
-            target_flat = targets.reshape(-1).cpu()
-            print(f"  pred_flat shape: {pred_flat.shape}")
-            print(f"  target_flat shape: {target_flat.shape}")
-            print(f"  pred_flat min/max: {pred_flat.min().item()}/{pred_flat.max().item()}")
-            print(f"  target_flat min/max: {target_flat.min().item()}/{target_flat.max().item()}")
-            
-            # Move confusion matrix to CPU for calculation
-            conf_matrix = self.confusion_matrix.cpu()
+            pred_flat = pred_classes.reshape(-1)
+            target_flat = targets.reshape(-1)
             
             # Create a mask for valid target indices (in case there are out-of-range values)
-            valid_mask = (target_flat >= 0) & (target_flat < self.num_classes)
-            print(f"  valid_mask sum: {valid_mask.sum().item()}/{len(valid_mask)}")
+            valid_mask = (target_flat >= 0) & (target_flat < self.num_classes) & \
+                         (pred_flat >= 0) & (pred_flat < self.num_classes)
+            
             pred_flat = pred_flat[valid_mask]
             target_flat = target_flat[valid_mask]
             
+            # Skip update if no valid pixels
+            if len(target_flat) == 0:
+                print("  No valid pixels found for confusion matrix update")
+                return
+                
+            # Create a temporary confusion matrix for this batch
+            batch_cm = torch.zeros((self.num_classes, self.num_classes), 
+                                  device=self.device, dtype=torch.float32)
+            
             # Update confusion matrix using bincount for efficiency
-            if len(target_flat) > 0:  # Only proceed if we have valid targets
-                try:
-                    # Instead of using bincount, directly update the confusion matrix
-                    for i in range(len(target_flat)):
-                        t = target_flat[i].item()
-                        p = pred_flat[i].item()
-                        conf_matrix[t, p] += 1
+            for t_idx in range(self.num_classes):
+                # Get predictions where the target is this class
+                t_mask = (target_flat == t_idx)
+                if not t_mask.any():
+                    continue
                     
-                    print("  Confusion matrix updated successfully")
-                except Exception as e:
-                    print(f"  Error in confusion matrix calculation: {str(e)}")
-                    print(f"  Error type: {type(e).__name__}")
-                    import traceback
-                    traceback.print_exc()
+                # Count occurrences of each predicted class for this target class
+                pred_for_class = pred_flat[t_mask]
+                for p_idx in range(self.num_classes):
+                    batch_cm[t_idx, p_idx] = (pred_for_class == p_idx).sum()
             
-            # Move back to device
-            self.confusion_matrix = conf_matrix.to(self.device)
+            # Add to the global confusion matrix
+            self.confusion_matrix += batch_cm
             
-            # Debug: Print confusion matrix sum
-            print(f"  Confusion matrix sum: {self.confusion_matrix.sum().item()}")
-            print(f"  Confusion matrix diagonal sum: {torch.diag(self.confusion_matrix).sum().item()}")
         else:
-            print("  Case: targets are one-hot encoded [B, C, H, W]")
             # For one-hot encoded targets
             if predictions.shape != targets.shape:
                 raise ValueError(
@@ -120,38 +90,108 @@ class SegmentationMetrics:
                 )
                 
             # Threshold predictions for binary case
-            preds = (predictions > threshold).long()
-            targets = targets.long()
+            preds = (predictions > threshold).float()
             
             # Move to CPU for calculation
-            preds_cpu = preds.cpu()
-            targets_cpu = targets.cpu()
-            conf_matrix = self.confusion_matrix.cpu()
+            B, C, H, W = predictions.shape
             
-            # Update confusion matrix
+            # Create a temporary confusion matrix for this batch
+            batch_cm = torch.zeros((self.num_classes, self.num_classes), 
+                                  device=self.device, dtype=torch.float32)
+            
+            # Update confusion matrix for each class
             for i in range(self.num_classes):
-                pred_i = preds_cpu[:, i].reshape(-1)
-                target_i = targets_cpu[:, i].reshape(-1)
+                pred_i = preds[:, i].reshape(-1)  # Predictions for class i
+                target_i = targets[:, i].reshape(-1)  # Targets for class i
                 
-                # Binary confusion matrix for this class
-                tp = (pred_i * target_i).sum().item()
-                fp = (pred_i * (1 - target_i)).sum().item()
-                fn = ((1 - pred_i) * target_i).sum().item()
-                tn = ((1 - pred_i) * (1 - target_i)).sum().item()
+                # True positives: predicted class i and actual class i
+                tp = (pred_i * target_i).sum()
+                batch_cm[i, i] = tp
                 
-                conf_matrix[i, i] += tp
-                conf_matrix[i, 1-i] += fp
-                conf_matrix[1-i, i] += fn
-                conf_matrix[1-i, 1-i] += tn
+                # False positives: predicted class i but not actual class i
+                # These are distributed across other classes based on actual class
+                for j in range(self.num_classes):
+                    if j != i:
+                        # Predicted class i but actual class j
+                        fp_ij = (pred_i * targets[:, j].reshape(-1)).sum()
+                        batch_cm[j, i] = fp_ij
             
-            # Move back to device
-            self.confusion_matrix = conf_matrix.to(self.device)
-            
-            # Debug: Print confusion matrix sum
-            print(f"  Confusion matrix sum: {self.confusion_matrix.sum().item()}")
-            print(f"  Confusion matrix diagonal sum: {torch.diag(self.confusion_matrix).sum().item()}")
+            # Add to the global confusion matrix
+            self.confusion_matrix += batch_cm
         
         print("  SegmentationMetrics.update completed")
+    
+    def compute(self):
+        """
+        Compute metrics from confusion matrix
+        Returns:
+            dict: Dictionary of metrics
+        """
+        print("Computing metrics from confusion matrix")
+        print(f"Confusion matrix shape: {self.confusion_matrix.shape}")
+        print(f"Confusion matrix sum: {self.confusion_matrix.sum().item()}")
+        
+        # Ensure we have data to compute metrics
+        if self.confusion_matrix.sum() == 0:
+            print("Warning: Confusion matrix is empty, returning zero metrics")
+            return {
+                "iou": torch.zeros(self.num_classes, device=self.device),
+                "dice": torch.zeros(self.num_classes, device=self.device),
+                "accuracy": torch.zeros(1, device=self.device),
+                "precision": torch.zeros(self.num_classes, device=self.device),
+                "recall": torch.zeros(self.num_classes, device=self.device),
+            }
+        
+        # Extract values from confusion matrix
+        tp = torch.diag(self.confusion_matrix)  # True positives for each class
+        
+        # Calculate class-wise metrics
+        # Sum over columns (axis=1) gives all predictions of this class (TP + FP)
+        # Sum over rows (axis=0) gives all targets of this class (TP + FN)
+        pred_sum = self.confusion_matrix.sum(dim=0)  # TP + FP (sum over rows)
+        target_sum = self.confusion_matrix.sum(dim=1)  # TP + FN (sum over columns)
+        
+        # IoU = TP / (TP + FP + FN)
+        # Add small epsilon to avoid division by zero
+        epsilon = 1e-6
+        union = pred_sum + target_sum - tp + epsilon
+        iou = tp / union
+        
+        # Clamp IoU values to be between 0 and 1
+        iou = torch.clamp(iou, min=0.0, max=1.0)
+        
+        # Dice = 2*TP / (2*TP + FP + FN) = 2*TP / (TP + FP + TP + FN)
+        dice_denominator = pred_sum + target_sum + epsilon
+        dice = 2 * tp / dice_denominator
+        dice = torch.clamp(dice, min=0.0, max=1.0)
+        
+        # Precision = TP / (TP + FP)
+        precision = tp / (pred_sum + epsilon)
+        precision = torch.clamp(precision, min=0.0, max=1.0)
+        
+        # Recall = TP / (TP + FN)
+        recall = tp / (target_sum + epsilon)
+        recall = torch.clamp(recall, min=0.0, max=1.0)
+        
+        # Accuracy = (TP + TN) / (TP + TN + FP + FN)
+        # For multi-class, we use the sum of diagonal (all TPs) divided by total sum
+        accuracy = tp.sum() / (self.confusion_matrix.sum() + epsilon)
+        accuracy = torch.clamp(accuracy, min=0.0, max=1.0)
+        
+        # Print metrics for debugging
+        print(f"IoU: {iou}")
+        print(f"Dice: {dice}")
+        print(f"Precision: {precision}")
+        print(f"Recall: {recall}")
+        print(f"Accuracy: {accuracy}")
+        
+        return {
+            "iou": iou,
+            "dice": dice,
+            "accuracy": accuracy.unsqueeze(0),
+            "precision": precision,
+            "recall": recall,
+        }
     
     def compute_iou(self) -> Tuple[torch.Tensor, float]:
         """
@@ -163,22 +203,39 @@ class SegmentationMetrics:
         # Debug prints
         print(f"Confusion matrix:\n{self.confusion_matrix}")
         
-        tp = torch.diag(self.confusion_matrix)
-        fp = self.confusion_matrix.sum(dim=0) - tp
-        fn = self.confusion_matrix.sum(dim=1) - tp
+        # Extract values from confusion matrix
+        tp = torch.diag(self.confusion_matrix)  # True positives (diagonal elements)
+        
+        # Ensure all values are non-negative
+        tp = torch.clamp(tp, min=0.0)
+        
+        # Calculate false positives and false negatives
+        fp = torch.clamp(self.confusion_matrix.sum(dim=0) - tp, min=0.0)  # Column sum - TP
+        fn = torch.clamp(self.confusion_matrix.sum(dim=1) - tp, min=0.0)  # Row sum - TP
         
         # Debug prints
         print(f"True positives: {tp}")
         print(f"False positives: {fp}")
         print(f"False negatives: {fn}")
         
-        # Compute IoU per class
-        iou = tp / (tp + fp + fn + 1e-7)  # Add epsilon to avoid division by zero
+        # Compute IoU per class: TP / (TP + FP + FN)
+        # Add epsilon to avoid division by zero
+        denominator = tp + fp + fn + 1e-7
+        iou = tp / denominator
+        
+        # Ensure IoU values are between 0 and 1
+        iou = torch.clamp(iou, min=0.0, max=1.0)
         
         # Debug prints
         print(f"IoU per class: {iou}")
         
-        mean_iou = iou.mean().item()
+        # Calculate mean IoU, ignoring NaN values
+        valid_iou = iou[~torch.isnan(iou)]
+        if len(valid_iou) > 0:
+            mean_iou = valid_iou.mean().item()
+        else:
+            mean_iou = 0.0
+            
         print(f"Mean IoU: {mean_iou}")
         
         return iou, mean_iou
