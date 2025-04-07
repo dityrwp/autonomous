@@ -28,12 +28,21 @@ def sigmoid_focal_loss(
     # Compute sigmoid probabilities
     p = torch.sigmoid(inputs)
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    
+    # For numerical stability, clamp p_t values away from 0 and 1
     p_t = p * targets + (1 - p) * (1 - targets)
-    loss = ce_loss * ((1 - p_t) ** gamma)
+    p_t = torch.clamp(p_t, min=1e-7, max=1-1e-7)
+    
+    # Compute focal weights
+    focal_weight = ((1 - p_t) ** gamma).clamp(min=1e-7)
+    loss = ce_loss * focal_weight
 
     if alpha >= 0:
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
+
+    # Ensure loss is non-negative
+    loss = torch.clamp(loss, min=0.0)
 
     if reduction == "mean":
         return loss.mean()
@@ -48,7 +57,7 @@ class BEVSegmentationHead(nn.Module):
     Features:
     - Lightweight architecture with grouped convolutions
     - FP16 support for intermediate features
-    - Efficient loss computation
+    - Efficient loss computation with combination of Dice and Focal loss
     - No grid transformation (assumes BEV-aligned input)
     """
     def __init__(
@@ -58,11 +67,16 @@ class BEVSegmentationHead(nn.Module):
         num_classes: int = 3,
         dropout: float = 0.1,
         use_focal_loss: bool = True,
-        focal_gamma: float = 2.0,
-        learnable_alpha: bool = True,
+        focal_gamma: float = 1.5,  # Reduced from 2.0 for more stability
+        learnable_alpha: bool = False,  # Changed to false for more stability
         initial_alpha: float = 0.25,
         class_weights: Optional[List[float]] = None,
-        use_dynamic_weighting: bool = True
+        use_dynamic_weighting: bool = False,  # Disabled by default
+        label_smoothing: float = 0.05,  # Added label smoothing
+        gradient_clip_value: float = 1.0,  # Added gradient clipping
+        use_dice_loss: bool = True,  # Enable Dice loss
+        dice_weight: float = 0.5,  # Weight for Dice loss in combined loss
+        dice_smooth: float = 1.0  # Smoothing factor for Dice loss
     ) -> None:
         super().__init__()
         
@@ -70,6 +84,13 @@ class BEVSegmentationHead(nn.Module):
         self.use_focal_loss = use_focal_loss
         self.focal_gamma = focal_gamma
         self.dropout = dropout
+        self.label_smoothing = label_smoothing
+        self.gradient_clip_value = gradient_clip_value
+        
+        # Dice loss parameters
+        self.use_dice_loss = use_dice_loss
+        self.dice_weight = dice_weight
+        self.dice_smooth = dice_smooth
         
         # Learnable class weights for focal loss
         if learnable_alpha:
@@ -90,17 +111,17 @@ class BEVSegmentationHead(nn.Module):
                 torch.tensor(class_weights, dtype=torch.float32)
             )
         else:
-            # Default: inverse frequency weights (to be updated during training)
+            # Default: equal weights
             self.register_buffer(
                 'class_weights', 
                 torch.ones(num_classes, dtype=torch.float32)
             )
         
-        # Dynamic class weighting based on frequency
+        # Dynamic class weighting based on frequency - deactivated by default now
         self.use_dynamic_weighting = use_dynamic_weighting
         self.class_count = torch.zeros(num_classes)
         self.total_pixels = 0
-        self.ema_factor = 0.99  # Exponential moving average factor
+        self.ema_factor = 0.9  # Reduced from 0.99 for faster adaptation if used
         
         # Optimized feature processing with more dropout for regularization
         self.features = nn.Sequential(
@@ -115,7 +136,7 @@ class BEVSegmentationHead(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, 1, bias=False),
             nn.BatchNorm2d(hidden_channels),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout * 1.5),  # Increased dropout for regularization
+            nn.Dropout2d(dropout),  # Reduced to standard dropout level
         )
         
         # Class prediction (keep in fp32 for stability)
@@ -128,11 +149,6 @@ class BEVSegmentationHead(nn.Module):
         self.register_buffer('running_mean_preds', 
                            torch.zeros(num_classes))
         self.register_buffer('running_count', torch.tensor(0))
-        
-        # Track class distribution for dynamic class weight adjustment
-        self.register_buffer('class_distribution', 
-                           torch.zeros(num_classes))
-        self.register_buffer('samples_seen', torch.tensor(0))
     
     def _init_weights(self) -> None:
         for m in self.modules():
@@ -185,15 +201,54 @@ class BEVSegmentationHead(nn.Module):
         # Clamp weights to reasonable range
         self.class_weights = smoothed_weights.clamp(0.5, 3.0)
     
-    @torch.amp.autocast(device_type='cuda')
+    def _dice_loss(self, probs, targets):
+        """
+        Compute Dice loss
+        
+        Args:
+            probs: Predicted probabilities [B, C, H, W]
+            targets: Target values [B, C, H, W]
+            
+        Returns:
+            Dice loss
+        """
+        # Reshape tensors for vectorized operations
+        B, C, H, W = probs.shape
+        probs = probs.view(B, C, -1)  # [B, C, H*W]
+        targets = targets.view(B, C, -1)  # [B, C, H*W]
+        
+        # Compute intersection and cardinalities
+        intersection = (probs * targets).sum(dim=2)  # [B, C]
+        cardinality = probs.sum(dim=2) + targets.sum(dim=2)  # [B, C]
+        
+        # Add smoothing factor for stability
+        dice = (2.0 * intersection + self.dice_smooth) / (cardinality + self.dice_smooth)
+        
+        # Convert to loss (1 - dice)
+        dice_loss = 1.0 - dice  # [B, C]
+        
+        # Apply class weights
+        weighted_dice_loss = dice_loss * self.class_weights.to(dice_loss.device)
+        
+        # Return mean across batches and classes
+        return weighted_dice_loss.mean()
+
     def forward(
         self,
         x: torch.Tensor,
         targets: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         
+        # Apply gradient clipping to stabilize training
+        if self.training:
+            # Clip gradients of previous layer parameters
+            for param in self.parameters():
+                if param.grad is not None:
+                    param.grad.data.clamp_(-self.gradient_clip_value, self.gradient_clip_value)
+        
         # Feature extraction (with FP16)
-        feat = self.features(x)
+        with torch.cuda.amp.autocast():
+            feat = self.features(x)
         
         # Class prediction
         logits = self.classifier(feat)
@@ -227,6 +282,11 @@ class BEVSegmentationHead(nn.Module):
                     one_hot_targets[:, c] = (targets == c).float()
                 targets = one_hot_targets
             
+            # Apply label smoothing if enabled
+            if self.label_smoothing > 0 and self.training:
+                smooth_value = self.label_smoothing / self.num_classes
+                targets = targets * (1 - self.label_smoothing) + smooth_value
+            
             # Update class weights if using dynamic weighting
             if self.use_dynamic_weighting:
                 with torch.no_grad():
@@ -240,19 +300,29 @@ class BEVSegmentationHead(nn.Module):
                     losses[f'class_{i}_running_mean'] = self.running_mean_preds[i].item()
                     losses[f'class_{i}_weight'] = self.class_weights[i].item()
             
-            # Use simplified focal loss calculation to avoid negative values
+            # Get probabilities for loss calculation
+            p = torch.sigmoid(logits)
+            # Clamp probabilities for numerical stability
+            p = torch.clamp(p, min=1e-6, max=1-1e-6)
+            
+            # Calculate losses
+            focal_loss = 0.0
+            dice_loss = 0.0
+            
+            # Calculate focal loss if enabled
             if self.use_focal_loss:
                 # Base binary cross entropy loss
                 bce_loss = F.binary_cross_entropy_with_logits(
                     logits, targets, reduction='none'
                 )
                 
-                # Get probabilities for focal weight calculation
-                p = torch.sigmoid(logits)
+                # Compute pt based on whether target is 1 or 0
                 pt = p * targets + (1 - p) * (1 - targets)
+                # Further ensure stability by clamping
+                pt = torch.clamp(pt, min=1e-6, max=1-1e-6)
                 
-                # Apply focal loss scaling (avoid potential numerical issues)
-                focal_weight = torch.pow((1 - pt).clamp(min=1e-7), self.focal_gamma)
+                # Compute focal weights with reduced gamma
+                focal_weight = ((1 - pt) ** self.focal_gamma)
                 
                 # Apply class weights
                 class_weights = self.class_weights.to(bce_loss.device)
@@ -260,41 +330,51 @@ class BEVSegmentationHead(nn.Module):
                 for c in range(self.num_classes):
                     class_weight_map[:, c] = class_weights[c]
                 
-                # Calculate alpha weights for pos/neg samples
-                alpha_weights = self.focal_alpha.to(bce_loss.device)
-                alpha_weight_map = torch.zeros_like(targets)
-                for c in range(self.num_classes):
-                    alpha_weight_map[:, c] = alpha_weights[c]
+                # Compute weighted loss with better numerical stability
+                weighted_loss = torch.clamp(bce_loss * focal_weight, min=0.0) * class_weight_map
                 
-                # Combine all weighting factors
-                weighted_loss = bce_loss * focal_weight * class_weight_map
-                pos_loss = alpha_weight_map * targets * weighted_loss
-                neg_loss = (1 - alpha_weight_map) * (1 - targets) * weighted_loss
+                # For debugging: record min/max before taking the mean
+                min_loss = weighted_loss.min().item()
+                max_loss = weighted_loss.max().item()
                 
-                # Final loss with guaranteed positive values
-                total_loss = (pos_loss + neg_loss).mean()
+                # Mean reduction
+                focal_loss = weighted_loss.mean()
                 
-                # Extra safety: ensure loss is strictly positive (should never happen with correct implementation)
-                if total_loss < 0:
-                    print(f"WARNING: Negative loss detected before clamping: {total_loss.item()}")
-                    total_loss = torch.clamp(total_loss, min=0.0)
+                # Final safeguard against negative loss (should never happen with clamping)
+                focal_loss = torch.clamp(focal_loss, min=0.0)
                 
-                losses['total_loss'] = total_loss
-                
-                # Add detailed diagnostics for debugging
-                with torch.no_grad():
-                    losses['bce_raw'] = bce_loss.mean().item()
-                    losses['focal_weight_mean'] = focal_weight.mean().item()
-                    losses['focal_weight_min'] = focal_weight.min().item()
-                    losses['focal_weight_max'] = focal_weight.max().item()
-                    losses['pt_min'] = pt.min().item()
-                    losses['pt_max'] = pt.max().item()
+                # Debug diagnostics
+                losses['min_loss'] = min_loss
+                losses['max_loss'] = max_loss
+                losses['bce_mean'] = bce_loss.mean().item()
+                losses['focal_weight_mean'] = focal_weight.mean().item()
+                losses['focal_loss'] = focal_loss.item()
+            
+            # Calculate Dice loss if enabled
+            if self.use_dice_loss:
+                dice_loss = self._dice_loss(p, targets)
+                losses['dice_loss'] = dice_loss.item()
+            
+            # Combine losses based on weights
+            if self.use_focal_loss and self.use_dice_loss:
+                # Combined loss
+                total_loss = (1.0 - self.dice_weight) * focal_loss + self.dice_weight * dice_loss
+            elif self.use_dice_loss:
+                # Only Dice loss
+                total_loss = dice_loss
+            elif self.use_focal_loss:
+                # Only Focal loss
+                total_loss = focal_loss
             else:
-                # Standard CE with class weights
+                # Fallback to standard CE with class weights
                 class_weights = self.class_weights.to(logits.device)
-                loss = F.cross_entropy(logits, targets.argmax(dim=1) if targets.dim() == 4 else targets, 
-                                      weight=class_weights)
-                losses['total_loss'] = loss
+                total_loss = F.cross_entropy(
+                    logits, 
+                    targets.argmax(dim=1) if targets.dim() == 4 else targets, 
+                    weight=class_weights
+                )
+            
+            losses['total_loss'] = total_loss
             
             return losses
         
