@@ -4,7 +4,7 @@
 train:
   epochs: 50  # Return to original value for proper convergence
   batch_size: 4  # Increase batch size if memory allows
-  num_workers: 6  # Keep the increased worker count
+  num_workers: 8  # Keep the increased worker count
   pin_memory: true
   mixed_precision: true  # Keep mixed precision for memory efficiency
   sync_bn: true  # Use SyncBatchNorm for multi-GPU
@@ -14,8 +14,8 @@ train:
 # Dataset Configuration
 dataset:
   # Paths to dataset
-  dataroot: "/home/mevi/Documents/bev/nuscenes07"  # Path to NuScenes dataset
-  bev_labels_dir: "/home/mevi/Documents/bev/test"  # Path to precomputed BEV labels
+  dataroot: "/home/mevi/Documents/bev/nuscenes_full"  # Updated path to NuScenes dataset
+  bev_labels_dir: "/home/mevi/Documents/bev/bev_labels"  # Updated path to precomputed BEV labels
   version: "v1.0-trainval"  # NuScenes version
 
 # Optimization
@@ -42,12 +42,21 @@ scheduler:
 # Loss Configuration
 loss:
   focal_loss:
-    gamma: 2.0
+    gamma: 1.5    # Reduced from 2.0 for more stability
     alpha: 0.25
   # Modified class weights based on observed class imbalance
-  class_weights: [1.0, 1.5, 2.5, 2.5, 2.0, 2.0]  # Increased weights for underrepresented classes
+  # Significantly increase weights for lane and road dividers to address the imbalance
+  class_weights: [0.75, 0.5, 4.0, 4.0, 1.5, 0.75]  # Increased weights for underrepresented classes
   loss_weights:
     segmentation: 1.0
+  # New parameters for numerical stability  
+  label_smoothing: 0.05
+  gradient_clip: 1.0
+  use_dynamic_weighting: false
+  # Dice loss parameters
+  use_dice_loss: true
+  dice_weight: 0.5  # Equal weight for dice and focal loss
+  dice_smooth: 1.0  # Smoothing factor for dice loss
 
 # Validation
 val:
@@ -62,7 +71,7 @@ checkpoint:
   save_interval: 5  # Save every 5 epochs
   save_best: true
   save_last: true
-  resume: true
+  resume: false  # Changed to false since we're starting fresh training with new data
   resume_path: "outputs/checkpoints/last_model.pth"
 
 # Logging
@@ -88,15 +97,18 @@ hardware:
 # Data Augmentation
 augmentation:
   enabled: true
-  random_flip: true
+  random_flip: true  # Only horizontal flips will be enabled in code
   random_rotate: true
-  rotate_range: [-0.78539816, 0.78539816]  # [-pi/4, pi/4]
+  rotate_range: [-3.0, 3.0]  # Reduced from [-10, 10] to prevent unrealistic road alignments
   scale_range: [0.95, 1.05]
   translation_std: [0.2, 0.2, 0.2]
+  cutout_prob: 0.3  # Reduced from default 0.5 
+  cutout_max_size: [20, 20]  # Reduced from default to be less disruptive
+  mixup_prob: 0.0  # Disabled mixup completely as it creates unrealistic scenes
 
 # Debug
 debug:
   enabled: false
-  subset_size: 100  # Number of samples to use in debug mode
+  subset_size: 8530  # Number of samples to use in debug mode
   profile: false  # Enable profiling
   check_nan: true  # Check for NaN values

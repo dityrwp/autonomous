@@ -2,52 +2,52 @@
 
 # Backbone Configurations
 camera_backbone:
-  name: "EfficientNetV2Backbone"
+  type: efficientnet
   pretrained: true
-  out_channels:
-    stage1: 32
-    stage2: 64
-    stage3: 128
-    stage4: 256
-    stage5: 512
+  channels:
+    stage3: 64
+    stage4: 128
+    stage5: 256
 
 lidar_backbone:
-  name: "SECONDBackbone"
+  type: pointpillars
   voxel_size: [0.8, 0.8, 0.8]
   point_cloud_range: [-51.2, -51.2, -5, 51.2, 51.2, 3]
   max_num_points: 32
-  max_voxels: 30000  # Reduced from 34000 to save memory
+  max_voxels: 20000
 
 # Fusion Configuration
 fusion:
-  name: "BEVFusion"
-  lidar_channels: 128
-  image_channels:
-    stage3: 256
-    stage4: 384
-    stage5: 512
+  type: cross_attention
+  use_multi_scale: true  # Enable multi-scale fusion
   output_channels: 128
-  spatial_size: [128, 128]  # Changed from bev_height/width to spatial_size to match implementation
-  chunk_size: 1024  # Reduced chunk size from 4096 to 1024 for more gradual processing
-  use_reentrant: true  # Enable reentrant checkpointing for better memory efficiency
+  spatial_size: [128, 128]
+  chunk_size: 1024
+  use_reentrant: true
+  stage_channels:
+    stage1: 64
+    stage2: 128
+    stage3: 256
 
 # Segmentation Head Configuration
 segmentation_head:
-  name: "BEVSegmentationHead"
   in_channels: 128
   hidden_channels: 128
   num_classes: 6  # NuScenes BEV classes: background, drivable_area, lane_divider, road_divider, ped_crossing, walkway
-  dropout: 0.1
   use_focal_loss: true
-  focal_gamma: 2.0
-  learnable_alpha: true
+  dropout: 0.1
+  focal_gamma: 1.5
+  learnable_alpha: false
   initial_alpha: 0.25
+  use_dice_loss: true
+  dice_weight: 0.5
+  dice_smooth: 1.0
 
 # Data Configuration
 input_config:
-  image_size: [900, 1600]  # H, W - NuScenes camera image size
+  image_size: [640, 480]
   num_cameras: 1  # Using front camera only
-  max_points_per_frame: 30000  # Reduced from 34000 to save memory
+  max_points_per_frame: 300000
 
 # Class Mapping
 class_map:
@@ -61,7 +61,22 @@ class_map:
 # Augmentation Configuration
 augmentation:
   random_flip: true
-  random_rotate: true
-  rotate_range: [-0.78539816, 0.78539816]  # [-pi/4, pi/4]
-  scale_range: [0.95, 1.05]
-  translation_std: [0.2, 0.2, 0.2]
+  random_rotate:
+    prob: 0.5
+    degrees: 10
+  random_scale:
+    prob: 0.5
+    scale_range: [0.95, 1.05]
+  random_translate:
+    prob: 0.5
+    translate_range: [0.1, 0.1]
+  random_brightness:
+    prob: 0.5
+    brightness_factor: 0.2
+  random_contrast:
+    prob: 0.5
+    contrast_range: [0.8, 1.2]
+  random_cutout:
+    prob: 0.5
+    num_cutouts: 5
+    cutout_size: [0.02, 0.1]
