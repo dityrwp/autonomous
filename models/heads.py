@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,16 +7,16 @@ import torch.nn.functional as F
 def sigmoid_focal_loss(
     inputs: torch.Tensor,
     targets: torch.Tensor,
-    alpha: float = -1,
     gamma: float = 2,
-    reduction: str = "mean"
+    reduction: str = "none"
 ) -> torch.Tensor:
     """
-    Compute focal loss for binary segmentation
+    Compute core focal loss for binary segmentation without alpha weighting.
+    Class weighting should be applied externally.
+    
     Args:
         inputs: [B, C, H, W] raw logits
         targets: [B, C, H, W] binary targets
-        alpha: Weighting factor for rare class
         gamma: Focusing parameter
         reduction: 'none', 'mean', 'sum'
     Returns:
@@ -33,13 +33,9 @@ def sigmoid_focal_loss(
     p_t = p * targets + (1 - p) * (1 - targets)
     p_t = torch.clamp(p_t, min=1e-7, max=1-1e-7)
     
-    # Compute focal weights
+    # Compute focal weights (core focal term)
     focal_weight = ((1 - p_t) ** gamma).clamp(min=1e-7)
     loss = ce_loss * focal_weight
-
-    if alpha >= 0:
-        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-        loss = alpha_t * loss
 
     # Ensure loss is non-negative
     loss = torch.clamp(loss, min=0.0)
@@ -51,339 +47,223 @@ def sigmoid_focal_loss(
     return loss
 
 
+class DecoderBlock(nn.Module):
+    """Decoder block for U-Net style architecture with skip connections"""
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        # Concat channels: in_channels (from prev layer) + skip_channels (from skip connection)
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels + skip_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with upsampling and skip connection
+        Args:
+            x: Input tensor from previous decoder stage
+            skip: Skip connection tensor from encoder
+        Returns:
+            Processed feature tensor at 2x spatial resolution
+        """
+        x = self.upsample(x)
+        # Ensure skip connection matches upsampled feature size
+        if x.shape[-2:] != skip.shape[-2:]:
+            skip = F.interpolate(skip, size=x.shape[-2:], mode='bilinear', align_corners=True)
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+
 class BEVSegmentationHead(nn.Module):
     """
-    Memory-efficient BEV segmentation head optimized for Jetson Orin NX.
+    U-Net style segmentation head optimized for BEV segmentation.
     Features:
-    - Lightweight architecture with grouped convolutions
-    - FP16 support for intermediate features
-    - Efficient loss computation with combination of Dice and Focal loss
-    - No grid transformation (assumes BEV-aligned input)
+    - Multi-scale decoder with skip connections from image BEV features
+    - Efficient combined Focal and Dice loss with class weighting
+    - Proper upsampling path to recover spatial resolution
     """
     def __init__(
         self,
-        in_channels: int = 128,
-        hidden_channels: int = 128,
-        num_classes: int = 3,
+        in_channels: int,           # Channels from the BEVFusion module output
+        skip_channels: Dict[str, int], # Channels of PROJECTED IMAGE BEV skip features
+                                      # Must match keys from DepthAugmentedBEVLifter
+                                      # Expected: {'stage1': C1, 'stage2': C2, 'stage3': C3}
+        decoder_channels: Tuple[int, int, int] = (128, 64, 32),
+        num_classes: int = 6,
         dropout: float = 0.1,
         use_focal_loss: bool = True,
-        focal_gamma: float = 1.5,  # Reduced from 2.0 for more stability
-        learnable_alpha: bool = False,  # Changed to false for more stability
-        initial_alpha: float = 0.25,
+        focal_gamma: float = 1.5,
         class_weights: Optional[List[float]] = None,
-        use_dynamic_weighting: bool = False,  # Disabled by default
-        label_smoothing: float = 0.05,  # Added label smoothing
-        gradient_clip_value: float = 1.0,  # Added gradient clipping
-        use_dice_loss: bool = True,  # Enable Dice loss
-        dice_weight: float = 0.5,  # Weight for Dice loss in combined loss
-        dice_smooth: float = 1.0  # Smoothing factor for Dice loss
+        use_dice_loss: bool = True,
+        dice_weight: float = 0.5,
+        dice_smooth: float = 1.0,
+        label_smoothing: float = 0.05
     ) -> None:
         super().__init__()
         
+        # Store parameters
         self.num_classes = num_classes
         self.use_focal_loss = use_focal_loss
         self.focal_gamma = focal_gamma
-        self.dropout = dropout
-        self.label_smoothing = label_smoothing
-        self.gradient_clip_value = gradient_clip_value
-        
-        # Dice loss parameters
         self.use_dice_loss = use_dice_loss
         self.dice_weight = dice_weight
         self.dice_smooth = dice_smooth
+        self.label_smoothing = label_smoothing
         
-        # Learnable class weights for focal loss
-        if learnable_alpha:
-            self.register_parameter(
-                'focal_alpha',
-                nn.Parameter(torch.full((num_classes,), initial_alpha))
-            )
-        else:
-            self.register_buffer(
-                'focal_alpha',
-                torch.full((num_classes,), initial_alpha)
-            )
-            
-        # Class weights for addressing imbalance
+        # Validate skip stage keys
+        expected_stages = {'stage1', 'stage2', 'stage3'}
+        if not all(stage in skip_channels for stage in expected_stages):
+            raise ValueError(f"skip_channels must contain all stages: {expected_stages}")
+        
+        # Register class weights
         if class_weights is not None:
-            self.register_buffer(
-                'class_weights',
-                torch.tensor(class_weights, dtype=torch.float32)
-            )
+            if len(class_weights) != num_classes:
+                raise ValueError(f"class_weights must have length {num_classes}")
+            self.register_buffer('class_weights', 
+                               torch.tensor(class_weights, dtype=torch.float32))
         else:
-            # Default: equal weights
-            self.register_buffer(
-                'class_weights', 
-                torch.ones(num_classes, dtype=torch.float32)
-            )
+            self.register_buffer('class_weights', 
+                               torch.ones(num_classes, dtype=torch.float32))
         
-        # Dynamic class weighting based on frequency - deactivated by default now
-        self.use_dynamic_weighting = use_dynamic_weighting
-        self.class_count = torch.zeros(num_classes)
-        self.total_pixels = 0
-        self.ema_factor = 0.9  # Reduced from 0.99 for faster adaptation if used
+        # --- Decoder Architecture ---
+        self.skip_channels = skip_channels
+        skip1_ch = self.skip_channels['stage1']  # Early features (highest resolution)
+        skip2_ch = self.skip_channels['stage2']  # Mid-level features
+        skip3_ch = self.skip_channels['stage3']  # Deep features
+        dec_ch1, dec_ch2, dec_ch3 = decoder_channels
         
-        # Optimized feature processing with more dropout for regularization
-        self.features = nn.Sequential(
-            # Spatial context with grouped 3x3
-            nn.Conv2d(in_channels, hidden_channels, 3, 
-                     padding=1, bias=False, groups=8),
-            nn.BatchNorm2d(hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout),
-            
-            # Channel mixing with 1x1
-            nn.Conv2d(hidden_channels, hidden_channels, 1, bias=False),
-            nn.BatchNorm2d(hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout),  # Reduced to standard dropout level
+        # Bottleneck conv to reduce channels before decoder
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels//2, 3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels//2),
+            nn.ReLU(inplace=True)
         )
         
-        # Class prediction (keep in fp32 for stability)
-        self.classifier = nn.Conv2d(hidden_channels, num_classes, 1)
+        # Decoder blocks with skip connections (bottom-up path)
+        self.dec_block1 = DecoderBlock(in_channels//2, skip3_ch, dec_ch1)  # Deep features
+        self.dec_block2 = DecoderBlock(dec_ch1, skip2_ch, dec_ch2)         # Mid-level
+        self.dec_block3 = DecoderBlock(dec_ch2, skip1_ch, dec_ch3)         # Fine details
         
-        # Initialize weights
+        # Final layers
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.final_conv = nn.Conv2d(dec_ch3, num_classes, 1)
+        
         self._init_weights()
-        
-        # Debug counters
-        self.register_buffer('running_mean_preds', 
-                           torch.zeros(num_classes))
-        self.register_buffer('running_count', torch.tensor(0))
     
-    def _init_weights(self) -> None:
+    def _init_weights(self):
+        """Initialize weights using Kaiming initialization."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                # Adjust fan-in for grouped convs
-                if m.groups > 1:
-                    fan_in = m.in_channels // m.groups
-                else:
-                    fan_in = m.in_channels
-                bound = 1 / (fan_in ** 0.5)
-                nn.init.uniform_(m.weight, -bound, bound)
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
     
-    def update_class_weights(self, targets):
-        """Update class weights based on observed class frequencies"""
-        if not self.use_dynamic_weighting:
-            return
-        
-        # Count class occurrences in this batch
-        batch_counts = torch.zeros(self.num_classes, device=targets.device)
-        
-        if targets.dim() == 4 and targets.size(1) > 1:  # One-hot encoded
-            batch_counts = targets.sum(dim=(0, 2, 3))
-        else:  # Class indices
-            if targets.dim() == 4:
-                targets = targets.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
-            for c in range(self.num_classes):
-                batch_counts[c] = (targets == c).sum()
-        
-        # Update total counts with EMA
-        total_pixels = batch_counts.sum()
-        if self.total_pixels == 0:  # First batch
-            self.class_count = batch_counts.float().to(self.class_count.device)
-            self.total_pixels = total_pixels.to(self.class_count.device)
-        else:
-            self.class_count = self.ema_factor * self.class_count + (1 - self.ema_factor) * batch_counts.float().to(self.class_count.device)
-            self.total_pixels = self.ema_factor * self.total_pixels + (1 - self.ema_factor) * total_pixels.to(self.class_count.device)
-        
-        # Calculate class frequencies
-        class_freq = self.class_count / max(self.total_pixels, 1)
-        
-        # Inverse frequency weighting with smoothing to prevent extreme values
-        smoothed_weights = 1.0 / (class_freq + 0.05)
-        
-        # Normalize weights to mean of 1.0
-        smoothed_weights = smoothed_weights * (self.num_classes / smoothed_weights.sum())
-        
-        # Clamp weights to reasonable range
-        self.class_weights = smoothed_weights.clamp(0.5, 3.0)
-    
-    def _dice_loss(self, probs, targets):
-        """
-        Compute Dice loss
-        
-        Args:
-            probs: Predicted probabilities [B, C, H, W]
-            targets: Target values [B, C, H, W]
-            
-        Returns:
-            Dice loss
-        """
-        # Reshape tensors for vectorized operations
-        B, C, H, W = probs.shape
-        probs = probs.view(B, C, -1)  # [B, C, H*W]
-        targets = targets.view(B, C, -1)  # [B, C, H*W]
-        
-        # Compute intersection and cardinalities
-        intersection = (probs * targets).sum(dim=2)  # [B, C]
-        cardinality = probs.sum(dim=2) + targets.sum(dim=2)  # [B, C]
-        
-        # Add smoothing factor for stability
-        dice = (2.0 * intersection + self.dice_smooth) / (cardinality + self.dice_smooth)
-        
-        # Convert to loss (1 - dice)
-        dice_loss = 1.0 - dice  # [B, C]
-        
-        # Apply class weights
-        weighted_dice_loss = dice_loss * self.class_weights.to(dice_loss.device)
-        
-        # Return mean across batches and classes
-        return weighted_dice_loss.mean()
-
     def forward(
         self,
         x: torch.Tensor,
+        skips: Dict[str, torch.Tensor],
         targets: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Forward pass of segmentation head
+        Args:
+            x: Input tensor from fusion [B, C, H, W]
+            skips: Dictionary of skip features from image BEV projection
+                  Must contain keys: 'stage1', 'stage2', 'stage3'
+            targets: Optional target tensor for training
+        Returns:
+            During training: Dict containing losses
+            During inference: Predicted segmentation probabilities
+        """
+        # Validate skip connection keys
+        for stage in ['stage1', 'stage2', 'stage3']:
+            if stage not in skips:
+                raise ValueError(f"Missing required skip connection: {stage}")
         
-        # Apply gradient clipping to stabilize training
-        if self.training:
-            # Clip gradients of previous layer parameters
-            for param in self.parameters():
-                if param.grad is not None:
-                    param.grad.data.clamp_(-self.gradient_clip_value, self.gradient_clip_value)
+        # Decoder path (bottom-up)
+        x = self.bottleneck(x)
+        x = self.dec_block1(x, skips['stage3'])  # 2x upsampling
+        x = self.dec_block2(x, skips['stage2'])  # 4x upsampling
+        x = self.dec_block3(x, skips['stage1'])  # 8x upsampling (final resolution)
         
-        # Feature extraction (with FP16)
-        with torch.cuda.amp.autocast():
-            feat = self.features(x)
-        
-        # Class prediction
-        logits = self.classifier(feat)
-        
-        # Update running statistics in training
-        if self.training:
-            with torch.no_grad():
-                probs = torch.sigmoid(logits.detach())
-                self.running_mean_preds = (
-                    self.running_mean_preds * self.running_count + 
-                    probs.mean(dim=(0, 2, 3))
-                ) / (self.running_count + 1)
-                self.running_count += 1
+        x = self.dropout(x)
+        logits = self.final_conv(x)
         
         if targets is not None:
-            losses = {}
-            
-            # Convert targets to one-hot format if they are class indices
-            if targets.dim() == 3 or (targets.dim() == 4 and targets.size(1) == 1):
-                # Handle both [B, H, W] and [B, 1, H, W] formats
-                if targets.dim() == 4:
-                    targets = targets.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
-                
-                # Convert class indices to one-hot
-                one_hot_targets = torch.zeros(
-                    (targets.size(0), self.num_classes, targets.size(1), targets.size(2)),
-                    dtype=torch.float32,
-                    device=targets.device
-                )
-                for c in range(self.num_classes):
-                    one_hot_targets[:, c] = (targets == c).float()
-                targets = one_hot_targets
-            
-            # Apply label smoothing if enabled
-            if self.label_smoothing > 0 and self.training:
-                smooth_value = self.label_smoothing / self.num_classes
-                targets = targets * (1 - self.label_smoothing) + smooth_value
-            
-            # Update class weights if using dynamic weighting
-            if self.use_dynamic_weighting:
-                with torch.no_grad():
-                    self.update_class_weights(targets)
-            
-            # Debug info
-            with torch.no_grad():
-                batch_means = logits.sigmoid().mean(dim=(0, 2, 3))
-                for i in range(self.num_classes):
-                    losses[f'class_{i}_mean'] = batch_means[i].item()
-                    losses[f'class_{i}_running_mean'] = self.running_mean_preds[i].item()
-                    losses[f'class_{i}_weight'] = self.class_weights[i].item()
-            
-            # Get probabilities for loss calculation
-            p = torch.sigmoid(logits)
-            # Clamp probabilities for numerical stability
-            p = torch.clamp(p, min=1e-6, max=1-1e-6)
-            
-            # Calculate losses
-            focal_loss = 0.0
-            dice_loss = 0.0
-            
-            # Calculate focal loss if enabled
-            if self.use_focal_loss:
-                # Base binary cross entropy loss
-                bce_loss = F.binary_cross_entropy_with_logits(
-                    logits, targets, reduction='none'
-                )
-                
-                # Compute pt based on whether target is 1 or 0
-                pt = p * targets + (1 - p) * (1 - targets)
-                # Further ensure stability by clamping
-                pt = torch.clamp(pt, min=1e-6, max=1-1e-6)
-                
-                # Compute focal weights with reduced gamma
-                focal_weight = ((1 - pt) ** self.focal_gamma)
-                
-                # Apply class weights
-                class_weights = self.class_weights.to(bce_loss.device)
-                class_weight_map = torch.zeros_like(targets)
-                for c in range(self.num_classes):
-                    class_weight_map[:, c] = class_weights[c]
-                
-                # Compute weighted loss with better numerical stability
-                weighted_loss = torch.clamp(bce_loss * focal_weight, min=0.0) * class_weight_map
-                
-                # For debugging: record min/max before taking the mean
-                min_loss = weighted_loss.min().item()
-                max_loss = weighted_loss.max().item()
-                
-                # Mean reduction
-                focal_loss = weighted_loss.mean()
-                
-                # Final safeguard against negative loss (should never happen with clamping)
-                focal_loss = torch.clamp(focal_loss, min=0.0)
-                
-                # Debug diagnostics
-                losses['min_loss'] = min_loss
-                losses['max_loss'] = max_loss
-                losses['bce_mean'] = bce_loss.mean().item()
-                losses['focal_weight_mean'] = focal_weight.mean().item()
-                losses['focal_loss'] = focal_loss.item()
-            
-            # Calculate Dice loss if enabled
-            if self.use_dice_loss:
-                dice_loss = self._dice_loss(p, targets)
-                losses['dice_loss'] = dice_loss.item()
-            
-            # Combine losses based on weights
-            if self.use_focal_loss and self.use_dice_loss:
-                # Combined loss
-                total_loss = (1.0 - self.dice_weight) * focal_loss + self.dice_weight * dice_loss
-            elif self.use_dice_loss:
-                # Only Dice loss
-                total_loss = dice_loss
-            elif self.use_focal_loss:
-                # Only Focal loss
-                total_loss = focal_loss
-            else:
-                # Fallback to standard CE with class weights
-                class_weights = self.class_weights.to(logits.device)
-                total_loss = F.cross_entropy(
-                    logits, 
-                    targets.argmax(dim=1) if targets.dim() == 4 else targets, 
-                    weight=class_weights
-                )
-            
-            losses['total_loss'] = total_loss
-            
-            return losses
+            return self._compute_loss(logits, targets)
         
-        else:
-            return torch.sigmoid(logits)  # [B, num_classes, H, W]
+        return torch.sigmoid(logits)
     
-    def get_debug_info(self) -> Dict[str, float]:
-        """Get debug information about class predictions"""
-        return {
-            f'class_{i}_running_mean': self.running_mean_preds[i].item()
-            for i in range(self.num_classes)
-        }
+    def _compute_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Compute the combined loss with class weighting."""
+        losses = {}
+        
+        # Convert targets to one-hot if needed
+        if targets.dim() == 3 or (targets.dim() == 4 and targets.size(1) == 1):
+            targets = targets.squeeze(1) if targets.dim() == 4 else targets
+            targets_one_hot = F.one_hot(targets, num_classes=self.num_classes)
+            targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()
+        else:
+            targets_one_hot = targets
+        
+        # Apply label smoothing if enabled
+        if self.label_smoothing > 0:
+            targets_one_hot = targets_one_hot * (1 - self.label_smoothing) + \
+                            self.label_smoothing / self.num_classes
+        
+        # Get probabilities
+        probs = torch.sigmoid(logits)
+        
+        # Focal Loss (with external class weighting)
+        if self.use_focal_loss:
+            focal_loss = sigmoid_focal_loss(
+                logits, targets_one_hot,
+                gamma=self.focal_gamma,
+                reduction='none'
+            )
+            # Apply class weights after focal loss calculation
+            focal_loss = focal_loss * self.class_weights.view(1, -1, 1, 1)
+            focal_loss = focal_loss.mean()
+            losses['focal_loss'] = focal_loss
+        
+        # Dice Loss
+        if self.use_dice_loss:
+            dice_loss = self._dice_loss(probs, targets_one_hot)
+            losses['dice_loss'] = dice_loss
+        
+        # Combine losses
+        total_loss = 0.0
+        if self.use_focal_loss:
+            total_loss += (1 - self.dice_weight) * focal_loss
+        if self.use_dice_loss:
+            total_loss += self.dice_weight * dice_loss
+        
+        losses['total_loss'] = total_loss
+        return losses
+    
+    def _dice_loss(self, probs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute Dice loss with class weights."""
+        B, C = probs.shape[:2]
+        
+        # Flatten predictions and targets
+        probs = probs.view(B, C, -1)
+        targets = targets.view(B, C, -1)
+        
+        # Compute intersection and cardinalities
+        intersection = (probs * targets).sum(dim=2)
+        cardinality = probs.sum(dim=2) + targets.sum(dim=2)
+        
+        # Compute Dice coefficient with smoothing
+        dice = (2. * intersection + self.dice_smooth) / (cardinality + self.dice_smooth)
+        
+        # Apply class weights and compute mean
+        weighted_dice = dice * self.class_weights.view(1, -1)
+        return 1. - weighted_dice.mean()
