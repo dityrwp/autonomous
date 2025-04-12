@@ -17,7 +17,7 @@ import yaml
 import numpy as np
 from tqdm import tqdm
 import cv2
-import math
+import matplotlib.pyplot as plt
 import logging
 
 from models.backbones import EfficientNetV2Backbone, SECONDBackbone
@@ -71,6 +71,11 @@ class Trainer:
         # Setup checkpoint directory
         self.checkpoint_dir = self.output_dir / 'checkpoints'
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Setup visualization directory
+        self.viz_dir = self.output_dir / 'visualizationsz'
+        self.viz_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Visualizations will be saved to {self.viz_dir}")
         
         # Training setup
         self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -301,8 +306,22 @@ class Trainer:
             stage_channels=stage_channels
         ).to(self.device)
         
-        # Initialize segmentation head
+        # Initialize segmentation head with updated parameters
         head_config = self.config.get('segmentation_head', {})
+        
+        # Get class colors for visualization
+        class_colors = self.config.get('class_colors', [
+            [252, 252, 252],  # Background
+            [166, 206, 227],  # Drivable Area
+            [202, 178, 214],  # Road Divider
+            [106, 61, 154],   # Lane Divider
+            [224, 74, 76],    # Walkway
+            [251, 154, 153]   # Pedestrian Crossing
+        ])
+        
+        # Use class weights from config or use defaults
+        class_weights = head_config.get('class_weights', [0.75, 0.5, 5.0, 5.0, 2.0, 1.0])
+        
         self.head = BEVSegmentationHead(
             in_channels=head_config.get('in_channels', 128),
             hidden_channels=head_config.get('hidden_channels', 128),
@@ -310,8 +329,11 @@ class Trainer:
             dropout=self.dropout_rate,  # Use our dropout rate
             use_focal_loss=head_config.get('use_focal_loss', True),
             focal_gamma=head_config.get('focal_gamma', 2.0),
-            learnable_alpha=head_config.get('learnable_alpha', True),
-            initial_alpha=head_config.get('initial_alpha', 0.25)
+            class_weights=class_weights,
+            label_smoothing=head_config.get('label_smoothing', 0.05),
+            use_dice_loss=head_config.get('use_dice_loss', True),
+            dice_weight=head_config.get('dice_weight', 0.5),
+            dice_smooth=head_config.get('dice_smooth', 1.0)
         ).to(self.device)
         
         # Return the main model component for early stopping
@@ -332,6 +354,10 @@ class Trainer:
         # Create progress bar
         progress_bar = tqdm(self.train_loader, desc=f"Epoch {self.epoch+1}/{self.config['epochs']}", 
                            unit="batch")
+        
+        # Calculate visualization interval - show 5 visualizations per epoch
+        train_viz_interval = max(1, len(self.train_loader) // 5)
+        print(f"Will visualize training predictions every {train_viz_interval} batches (5 times per epoch)")
         
         # Enable cuDNN benchmarking for better performance
         torch.backends.cudnn.benchmark = True
@@ -487,6 +513,17 @@ class Trainer:
                     'lr': f"{self.optimizer.param_groups[0]['lr']:.6f}"
                 })
             
+            # Visualize training predictions 5 times per epoch
+            if batch_idx % train_viz_interval == 0:
+                try:
+                    # Ensure predictions is a valid tensor
+                    if isinstance(predictions, torch.Tensor) and predictions.dim() == 4:
+                        viz_name = f'train_epoch{self.epoch+1}_batch{batch_idx}'
+                        self._visualize_predictions(images.detach(), predictions.detach(), targets.detach(), prefix=viz_name)
+                        print(f"  Visualized training batch {batch_idx}")
+                except Exception as e:
+                    print(f"Warning: Failed to visualize training predictions: {e}")
+            
             self.train_step += 1
             
             # Clear cache periodically to prevent memory fragmentation
@@ -544,75 +581,95 @@ class Trainer:
             print(f"Could not add learning rate curve to TensorBoard: {e}")
     
     def _visualize_predictions(self, images, predictions, targets, prefix='train'):
-        # Reduce the number of samples to visualize
-        num_samples = min(2, images.size(0))  # Only visualize 2 samples max
-        
-        # Use a smaller figure size
-        fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4*num_samples))
-        
-        # If only one sample, make sure axes is 2D
-        if num_samples == 1:
-            axes = axes.reshape(1, -1)
-        
-        # Get class names
-        class_names = ['background', 'drivable_area', 'lane_divider', 
-                      'road_divider', 'walkway', 'ped_crossing']
-        
-        for i in range(num_samples):
-            # Original image
-            img = images[i].cpu().permute(1, 2, 0).numpy()
-            img = (img - img.min()) / (img.max() - img.min())  # Normalize to [0, 1]
-            axes[i, 0].imshow(img)
-            axes[i, 0].set_title('Input Image')
-            axes[i, 0].axis('off')
+        """Visualize model predictions and save to disk."""
+        try:
+            import matplotlib.pyplot as plt
             
-            # Ground truth segmentation
-            if targets.dim() == 4:  # [B, C, H, W]
-                target = targets[i].argmax(dim=0).cpu().numpy()
-            else:
-                target = targets[i].cpu().numpy()
+            # Ensure the visualization directory exists
+            if not hasattr(self, 'viz_dir'):
+                self.viz_dir = self.output_dir / 'visualizations'
+                self.viz_dir.mkdir(parents=True, exist_ok=True)
                 
-            target_rgb = np.zeros((target.shape[0], target.shape[1], 3), dtype=np.uint8)
-            for cls_idx, color in enumerate(self.class_colors):
-                target_rgb[target == cls_idx] = color
-                
-            axes[i, 1].imshow(target_rgb)
-            axes[i, 1].set_title('Ground Truth')
-            axes[i, 1].axis('off')
+            # Reduce the number of samples to visualize
+            num_samples = min(2, images.size(0))  # Only visualize 2 samples max
             
-            # Predicted segmentation
-            pred = predictions[i].argmax(dim=0).cpu().numpy()
-            pred_rgb = np.zeros((pred.shape[0], pred.shape[1], 3), dtype=np.uint8)
-            for cls_idx, color in enumerate(self.class_colors):
-                pred_rgb[pred == cls_idx] = color
+            # Use a smaller figure size
+            fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4*num_samples))
+            
+            # If only one sample, make sure axes is 2D
+            if num_samples == 1:
+                axes = axes.reshape(1, -1)
+            
+            # Get class names
+            class_names = ['background', 'drivable_area', 'lane_divider', 
+                          'road_divider', 'walkway', 'ped_crossing']
+            
+            # Get class colors from config
+            class_colors = self.config.get('class_colors', [
+                [252, 252, 252],  # Background
+                [166, 206, 227],  # Drivable Area
+                [202, 178, 214],  # Road Divider
+                [106, 61, 154],   # Lane Divider
+                [224, 74, 76],    # Walkway
+                [251, 154, 153]   # Pedestrian Crossing
+            ])
+            
+            for i in range(num_samples):
+                # Original image
+                img = images[i].cpu().permute(1, 2, 0).numpy()
+                img = (img - img.min()) / (img.max() - img.min())  # Normalize to [0, 1]
+                axes[i, 0].imshow(img)
+                axes[i, 0].set_title('Input Image')
+                axes[i, 0].axis('off')
                 
-            axes[i, 2].imshow(pred_rgb)
-            axes[i, 2].set_title('Prediction')
-            axes[i, 2].axis('off')
-        
-        # Add a color legend at the bottom
-        legend_elements = [plt.Rectangle((0, 0), 1, 1, color=[c/255 for c in color], label=name) 
-                          for color, name in zip(self.class_colors, class_names)]
-        fig.legend(handles=legend_elements, loc='lower center', ncol=len(class_names), 
-                  bbox_to_anchor=(0.5, 0), fontsize=10)
-        
-        # Adjust layout to make room for the legend
-        plt.tight_layout(rect=[0, 0.05, 1, 1])
-        
-        # Save figure
-        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        viz_path = self.viz_dir / f'{prefix}_predictions_{self.epoch}_{timestamp}.png'
-        plt.savefig(viz_path)
-        plt.close(fig)
-        
-        # Add to TensorBoard less frequently
-        if self.train_step % (self.config['log_interval'] * 5) == 0:
-            try:
-                img = plt.imread(viz_path)
-                self.writer.add_image(f'{prefix.capitalize()}/Predictions', 
-                                    img.transpose(2, 0, 1), self.train_step)
-            except Exception as e:
-                print(f"Warning: Could not add image to TensorBoard: {e}")
+                # Ground truth segmentation
+                if targets.dim() == 4:  # [B, C, H, W]
+                    target = targets[i].argmax(dim=0).cpu().numpy()
+                else:
+                    target = targets[i].cpu().numpy()
+                    
+                target_rgb = np.zeros((target.shape[0], target.shape[1], 3), dtype=np.uint8)
+                for cls_idx, color in enumerate(class_colors):
+                    if cls_idx < len(class_colors):  # Safety check
+                        target_rgb[target == cls_idx] = color
+                    
+                axes[i, 1].imshow(target_rgb)
+                axes[i, 1].set_title('Ground Truth')
+                axes[i, 1].axis('off')
+                
+                # Predicted segmentation
+                pred = predictions[i].argmax(dim=0).cpu().numpy()
+                pred_rgb = np.zeros((pred.shape[0], pred.shape[1], 3), dtype=np.uint8)
+                for cls_idx, color in enumerate(class_colors):
+                    if cls_idx < len(class_colors):  # Safety check
+                        pred_rgb[pred == cls_idx] = color
+                    
+                axes[i, 2].imshow(pred_rgb)
+                axes[i, 2].set_title('Prediction')
+                axes[i, 2].axis('off')
+            
+            # Add a color legend at the bottom
+            legend_elements = [plt.Rectangle((0, 0), 1, 1, color=[c/255 for c in color], label=name) 
+                              for color, name in zip(class_colors, class_names)]
+            fig.legend(handles=legend_elements, loc='lower center', ncol=len(class_names), 
+                      bbox_to_anchor=(0.5, 0), fontsize=10)
+            
+            # Adjust layout to make room for the legend
+            plt.tight_layout(rect=[0, 0.05, 1, 1])
+            
+            # Save figure
+            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            viz_path = self.viz_dir / f'{prefix}_predictions_{self.epoch}_{timestamp}.png'
+            plt.savefig(viz_path)
+            plt.close(fig)
+            
+            print(f"  Saved visualization to {viz_path}")
+            return True
+        except Exception as e:
+            print(f"Warning: Visualization failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
     
     def validate(self):
         """Run validation on the validation dataset"""
@@ -634,6 +691,10 @@ class Trainer:
         
         # Create progress bar
         progress_bar = tqdm(self.val_loader, desc=f"Validating")
+        
+        # Calculate visualization interval - show 3 visualizations per validation run
+        val_viz_interval = max(1, len(self.val_loader) // 3)
+        print(f"Will visualize validation predictions every {val_viz_interval} batches (3 times per validation)")
         
         # Validate
         with torch.no_grad():
@@ -775,7 +836,7 @@ class Trainer:
                             else:
                                 print(f"Warning: Expected 4D predictions tensor, got shape {pred_tensor.shape}")
                         
-                        print("  SegmentationMetrics.update completed")
+                        #print("  SegmentationMetrics.update completed")
                     
                     # Update progress tracking
                     batch_size = images.size(0)
@@ -791,6 +852,17 @@ class Trainer:
                         except Exception as e:
                             # Ignore errors in progress bar updates
                             print(f"Warning: Error updating progress bar: {str(e)}")
+                    
+                    # Visualize validation predictions 3 times per validation run
+                    if batch_idx % val_viz_interval == 0:
+                        try:
+                            # Ensure predictions is a valid tensor
+                            if isinstance(predictions, torch.Tensor) and predictions.dim() == 4:
+                                viz_name = f'val_epoch{self.epoch+1}_batch{batch_idx}'
+                                self._visualize_predictions(images.detach(), predictions.detach(), targets.detach(), prefix=viz_name)
+                                print(f"  Visualized validation batch {batch_idx}")
+                        except Exception as e:
+                            print(f"Warning: Failed to visualize validation predictions: {e}")
                 
                 except Exception as e:
                     print(f"Error in validation batch {batch_idx}: {str(e)}")
@@ -1058,7 +1130,7 @@ def main():
     debug_mode = args.debug
     if debug_mode:
         print("Debug mode enabled - using smaller dataset")
-        subset_size = 100 # Small subset for debugging
+        subset_size = 9667 # Small subset for debugging
     
     # Memory optimization
     if args.optimize_memory:
@@ -1125,8 +1197,8 @@ def main():
             flip_prob=0.3,
             rotate_prob=0.3,
             rotate_range=(-5, 5),
-            scale_prob=0.3,
-            translate_prob=0.3,
+            scale_prob=0.0,
+            translate_prob=0.0,
             cutout_prob=0.0,
             mixup_prob=0.0,
             feature_noise_prob=0.3
