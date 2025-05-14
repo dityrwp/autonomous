@@ -5,9 +5,11 @@ camera_backbone:
   type: efficientnet
   pretrained: true
   channels:
-    stage3: 64
-    stage4: 128
-    stage5: 256
+    stage1: 32  # Early features (highest resolution)
+    stage2: 64  # Mid-level features
+    stage3: 128 # Higher-level features
+    stage4: 256 # Deep features
+    stage5: 512 # Final features
 
 lidar_backbone:
   type: pointpillars
@@ -16,38 +18,57 @@ lidar_backbone:
   max_num_points: 32
   max_voxels: 20000
 
+# BEV Lifter Configuration
+bev_lifter:
+  bev_size: [128, 128]  # Match segmentation head output size
+  bev_skip_channels:
+    stage1: 32  # Early features (highest resolution)
+    stage2: 64  # Mid-level features
+    stage3: 128 # Deep features
+  main_bev_channels: 128
+  main_bev_source_stages: ['stage5']
+  depth_channels: 64
+  min_depth: 1.0
+  max_depth: 60.0
+  voxel_size: [0.4, 0.4]
+
 # Fusion Configuration
 fusion:
   type: cross_attention
   use_multi_scale: true  # Enable multi-scale fusion
-  output_channels: 128
-  spatial_size: [128, 128]
+  output_channels: 256  # Match with segmentation head input
+  spatial_size: [128, 128]  # Match BEV size
   chunk_size: 1024
   use_reentrant: true
   stage_channels:
-    stage1: 64
-    stage2: 128
-    stage3: 256
+    stage1: 32
+    stage2: 64
+    stage3: 128
 
 # Segmentation Head Configuration
 segmentation_head:
-  in_channels: 128
-  hidden_channels: 128
-  num_classes: 6  # NuScenes BEV classes: background, drivable_area, lane_divider, road_divider, ped_crossing, walkway
-  use_focal_loss: true
+  in_channels: 256  # Match fusion output channels
+  skip_channels:
+    stage1: 32  # Match BEV lifter skip channels
+    stage2: 64
+    stage3: 128
+  decoder_channels: [128, 64, 32]  # Decoder channel progression
+  num_classes: 6  # NuScenes BEV classes
   dropout: 0.1
-  focal_gamma: 1.5
-  learnable_alpha: false
-  initial_alpha: 0.25
+  use_focal_loss: true
+  focal_gamma: 2
+  class_weights: [0.75, 0.5, 5.0, 5.0, 2.0, 1.0]  # Background, Road, Lane Divider, Road Divider, Walkway, Ped Crossing
   use_dice_loss: true
   dice_weight: 0.5
   dice_smooth: 1.0
+  label_smoothing: 0.05
+  output_size: [128, 128]  # Match BEV lifter output size
 
 # Data Configuration
 input_config:
   image_size: [640, 480]
   num_cameras: 1  # Using front camera only
-  max_points_per_frame: 300000
+  max_points_per_frame: 20000
 
 # Class Mapping
 class_map:
@@ -58,25 +79,3 @@ class_map:
   ped_crossing: 4
   walkway: 5
 
-# Augmentation Configuration
-augmentation:
-  random_flip: true
-  random_rotate:
-    prob: 0.5
-    degrees: 10
-  random_scale:
-    prob: 0.5
-    scale_range: [0.95, 1.05]
-  random_translate:
-    prob: 0.5
-    translate_range: [0.1, 0.1]
-  random_brightness:
-    prob: 0.5
-    brightness_factor: 0.2
-  random_contrast:
-    prob: 0.5
-    contrast_range: [0.8, 1.2]
-  random_cutout:
-    prob: 0.5
-    num_cutouts: 5
-    cutout_size: [0.02, 0.1]

@@ -2,7 +2,7 @@
 
 # Basic Training Settings
 train:
-  epochs: 50  # Return to original value for proper convergence
+  epochs: 54 # Return to original value for proper convergence
   batch_size: 4  # Increase batch size if memory allows
   num_workers: 8  # Keep the increased worker count
   pin_memory: true
@@ -17,6 +17,15 @@ dataset:
   dataroot: "/home/mevi/Documents/bev/nuscenes_full"  # Updated path to NuScenes dataset
   bev_labels_dir: "/home/mevi/Documents/bev/bev_labels"  # Updated path to precomputed BEV labels
   version: "v1.0-trainval"  # NuScenes version
+
+# Class Colors for Visualization (RGB format)
+class_colors:
+  - [252, 252, 252]  # Background (near white)
+  - [166, 206, 227]  # Drivable Area (light blue)
+  - [202, 178, 214]  # Road Divider (grayish purple)
+  - [106, 61, 154]   # Lane Divider (dark purple)
+  - [224, 74, 76]    # Walkway (red)
+  - [251, 154, 153]  # Pedestrian Crossing (light pink)
 
 # Optimization
 optimizer:
@@ -42,11 +51,11 @@ scheduler:
 # Loss Configuration
 loss:
   focal_loss:
-    gamma: 1.5    # Reduced from 2.0 for more stability
+    gamma: 2.0    # Reduced from 2.0 for more stability
     alpha: 0.25
   # Modified class weights based on observed class imbalance
   # Significantly increase weights for lane and road dividers to address the imbalance
-  class_weights: [0.75, 0.5, 4.0, 4.0, 1.5, 0.75]  # Increased weights for underrepresented classes
+  class_weights: [0.75, 0.5, 5.0, 5.0, 2.0, 1.0]  # Increased weights for underrepresented classes
   loss_weights:
     segmentation: 1.0
   # New parameters for numerical stability  
@@ -68,11 +77,11 @@ val:
 # Checkpointing
 checkpoint:
   save_dir: "checkpoints"
-  save_interval: 5  # Save every 5 epochs
+  save_interval: 2  # Save every 5 epochs
   save_best: true
   save_last: true
-  resume: false  # Changed to false since we're starting fresh training with new data
-  resume_path: "outputs/checkpoints/last_model.pth"
+  resume: true  # Changed to false since we're starting fresh training with new data
+  resume_path: "outputs/checkpoints/checkpoint_epoch_50.pth"
 
 # Logging
 logging:
@@ -94,21 +103,10 @@ hardware:
   dist_backend: "nccl"
   dist_url: "tcp://localhost:12345"
 
-# Data Augmentation
-augmentation:
-  enabled: true
-  random_flip: true  # Only horizontal flips will be enabled in code
-  random_rotate: true
-  rotate_range: [-3.0, 3.0]  # Reduced from [-10, 10] to prevent unrealistic road alignments
-  scale_range: [0.95, 1.05]
-  translation_std: [0.2, 0.2, 0.2]
-  cutout_prob: 0.3  # Reduced from default 0.5 
-  cutout_max_size: [20, 20]  # Reduced from default to be less disruptive
-  mixup_prob: 0.0  # Disabled mixup completely as it creates unrealistic scenes
 
 # Debug
 debug:
   enabled: false
-  subset_size: 8530  # Number of samples to use in debug mode
+  subset_size: 9667  # Number of samples to use in debug mode
   profile: false  # Enable profiling
   check_nan: true  # Check for NaN values
