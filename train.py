@@ -38,6 +38,7 @@ class Trainer:
         config: dict,
         train_config: dict,
         train_loader: DataLoader,
+        model_config: dict,
         val_loader: Optional[DataLoader] = None,
         device: torch.device = None,
         output_dir: Path = None,
@@ -67,7 +68,10 @@ class Trainer:
         self.val_loader = val_loader
         self.output_dir = Path(output_dir) if output_dir else Path('outputs')
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+        self.model_config = model_config
+
+        self.num_classes = self.model_config.get('segmentation_head', {}).get('num_classes', 6) # Default 6 if not found
+        print(f"Number of classes set to: {self.num_classes}")
         # Setup checkpoint directory
         self.checkpoint_dir = self.output_dir / 'checkpoints'
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -547,6 +551,20 @@ class Trainer:
         print(f"  Loss: {avg_loss:.4f}")
         print(f"  Mean IoU: {metrics.get('mean_iou', 0):.4f}")
         
+        # Add detailed class IoU printing
+        if 'class_iou' in metrics:
+            print(f"  Class IoU details:")
+            class_names = self.config.get('class_names', [
+                'background', 'drivable_area', 'road_divider', 
+                'lane_divider', 'walkway', 'ped_crossing'
+            ])
+            for i, iou in enumerate(metrics['class_iou']):
+                class_name = class_names[i] if i < len(class_names) else f"Class {i}"
+                print(f"    {class_name}: {iou:.4f}")
+        
+        # Create and save loss plot
+        self._plot_epoch_losses(avg_loss)
+        
         self.epoch += 1
         return metrics
     
@@ -671,227 +689,170 @@ class Trainer:
             traceback.print_exc()
             return False
     
+    @torch.no_grad() # Decorator for no gradient calculation
     def validate(self):
         """Run validation on the validation dataset"""
         # Set models to evaluation mode
         self.camera_backbone.eval()
         self.lidar_backbone.eval()
-        self.fusion.eval()
-        self.head.eval()
+        # Ensure projection layers are also in eval mode
         self.image_projections.eval()
         self.lidar_projections.eval()
-        
+        self.fusion.eval()
+        self.head.eval()
+
         # Reset validation metrics
         self.val_metrics.reset()
-        
+
         # Initialize tracking variables
         running_loss = 0.0
         processed_samples = 0
         val_start_time = time.time()
-        
+
         # Create progress bar
-        progress_bar = tqdm(self.val_loader, desc=f"Validating")
-        
-        # Calculate visualization interval - show 3 visualizations per validation run
-        val_viz_interval = max(1, len(self.val_loader) // 3)
-        print(f"Will visualize validation predictions every {val_viz_interval} batches (3 times per validation)")
-        
+        progress_bar = tqdm(self.val_loader, desc=f"Validating Epoch {self.epoch+1}", unit="batch", leave=False) # Corrected epoch display
+
         # Validate
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(progress_bar):
-                # Move data to device
-                images = batch.get('image', None)
-                lidar_points = batch.get('lidar', None)
-                targets = batch.get('bev_label', None)
-                calibs = batch.get('calib', None)
-                
-                # Skip batch if missing required data
-                if images is None or lidar_points is None or targets is None or calibs is None:
-                    print(f"Warning: Skipping batch {batch_idx} due to missing data")
-                    continue
-                
-                # Check tensor dimensions to prevent errors
-                try:
-                    images = images.to(self.device)
-                    targets = targets.to(self.device)
-                    
-                    # Ensure targets are in the correct format
-                    # If targets are [B, 1, H, W] with class indices, convert to [B, H, W]
-                    if targets.dim() == 4 and targets.size(1) == 1:
-                        targets = targets.squeeze(1)
-                    
-                    # Process lidar points
-                    processed_lidar = []
-                    for points in lidar_points:
-                        processed_lidar.append(points.to(self.device))
-                    
-                    # Extract features
-                    image_features_dict = self.camera_backbone(images)
-                    
-                    # Process each point cloud and get features
-                    # The lidar_backbone only takes one argument (points)
-                    lidar_features = {}
-                    for i, points in enumerate(processed_lidar):
-                        # Process each point cloud individually
-                        features = self.lidar_backbone(points.unsqueeze(0))
-                        # Store features for each batch item
-                        if i == 0:
-                            # Initialize dictionaries with the right structure
-                            for key in features['bev_features']:
-                                lidar_features[key] = []
-                        
-                        # Collect features from each batch item
-                        for key in features['bev_features']:
-                            lidar_features[key].append(features['bev_features'][key])
-                    
-                    # Create dictionary of lidar features for each stage with projections
-                    lidar_features_dict = {}
-                    for stage in ['stage1', 'stage2', 'stage3']:
-                        # Stack features if they have the same shape
-                        if all(feat.shape[2:] == lidar_features[stage][0].shape[2:] for feat in lidar_features[stage]):
-                            stacked_features = torch.cat(lidar_features[stage], dim=0)
-                            lidar_features_dict[stage] = self.lidar_projections[stage](stacked_features)
-                        else:
-                            # Fallback: just use the first batch item's features
-                            lidar_features_dict[stage] = self.lidar_projections[stage](lidar_features[stage][0])
-                    
-                    # Fuse features
+        # with torch.no_grad(): # Decorator handles this
+        for batch_idx, batch in enumerate(progress_bar):
+            # Move data to device
+            images = batch.get('image', None)
+            lidar_points = batch.get('lidar', None) # Still keep as list for backbone
+            targets = batch.get('bev_label', None)
+            # calibs = batch.get('calib', None) # Calib not used in this forward pass
+
+            # Skip batch if missing required data
+            if images is None or lidar_points is None or targets is None:
+                print(f"Warning: Skipping validation batch {batch_idx} due to missing data")
+                continue
+
+            try:
+                images = images.to(self.device)
+                targets = targets.to(self.device)
+                processed_lidar = [points.to(self.device) for points in lidar_points] # Move list items
+
+                # Ensure targets are Long indices for metrics later
+                if targets.dim() == 4 and targets.size(1) == 1:
+                     target_indices = targets.squeeze(1).long()
+                elif targets.dim() == 3:
+                     target_indices = targets.long()
+                else: # Assume one-hot, get indices
+                     target_indices = targets.argmax(dim=1).long()
+
+
+                # --- FORWARD PASS with AUTOCAST ---
+                # Wrap the forward pass in autocast, similar to training
+                with amp.autocast(enabled=self.scaler.is_enabled()): # Use scaler state to match training
+                    # 1. Extract features from camera
+                    image_feats = self.camera_backbone(images)
+
+                    # 2. Process LiDAR & Project
+                    # ... (Your logic for lidar_feats_list and stacking/processing lidar_feats_raw) ...
+                    lidar_feats_list = []
+                    for points in processed_lidar:
+                        if points.dim() == 2: points = points.unsqueeze(0)
+                        lidar_out = self.lidar_backbone(points)
+                        lidar_feats_list.append(lidar_out)
+
+                    if all(f['bev_features']['stage3'].shape == lidar_feats_list[0]['bev_features']['stage3'].shape for f in lidar_feats_list):
+                         lidar_feats_raw = { stage: torch.cat([f['bev_features'][stage] for f in lidar_feats_list], dim=0)
+                                             for stage in ['stage1', 'stage2', 'stage3'] }
+                    else: # Fallback
+                         lidar_feats_raw = { stage: lidar_feats_list[0]['bev_features'][stage]
+                                             for stage in ['stage1', 'stage2', 'stage3'] }
+
+                    lidar_features_dict = { fusion_stage: self.lidar_projections[fusion_stage](lidar_feats_raw[lidar_stage])
+                                            for lidar_stage, fusion_stage in zip(['stage1', 'stage2', 'stage3'], ['stage1', 'stage2', 'stage3']) }
+
+
+                    # 3. Project Image features
+                    image_features_dict = {}
+                    for config_stage, fusion_stage in self.config_to_fusion_stage.items():
+                        if config_stage in image_feats:
+                            image_features_dict[fusion_stage] = self.image_projections[fusion_stage](image_feats[config_stage])
+                        # ... (Fallback logic) ...
+
+                    # 4. Fuse features
                     fused_feats, _ = self.fusion(lidar_features_dict, image_features_dict)
-                    
-                    # Get predictions and compute loss
-                    with amp.autocast():
-                        # Convert targets to one-hot encoding for loss calculation
-                        if targets.dim() == 3:  # [B, H, W]
-                            num_classes = self.config['num_classes']
-                            targets_one_hot = torch.zeros(
-                                targets.size(0), num_classes, targets.size(1), targets.size(2),
-                                device=self.device
-                            )
-                            for cls in range(num_classes):
-                                targets_one_hot[:, cls] = (targets == cls).float()
-                            
-                            # Compute losses with one-hot encoded targets
-                            try:
-                                losses = self.head(fused_feats, targets_one_hot)
-                                if not isinstance(losses, dict):
-                                    # If head returns predictions instead of losses, create a dummy loss
-                                    print(f"Warning: head returned predictions instead of losses in batch {batch_idx}")
-                                    losses = {'total_loss': torch.tensor(0.0, device=self.device)}
-                            except Exception as e:
-                                print(f"Error computing losses in batch {batch_idx}: {str(e)}")
-                                # Create dummy losses to continue validation
-                                losses = {'total_loss': torch.tensor(0.0, device=self.device)}
-                        else:
-                            # Targets are already one-hot encoded
-                            try:
-                                losses = self.head(fused_feats, targets)
-                                if not isinstance(losses, dict):
-                                    # If head returns predictions instead of losses, create a dummy loss
-                                    print(f"Warning: head returned predictions instead of losses in batch {batch_idx}")
-                                    losses = {'total_loss': torch.tensor(0.0, device=self.device)}
-                            except Exception as e:
-                                print(f"Error computing losses in batch {batch_idx}: {str(e)}")
-                                # Create dummy losses to continue validation
-                                losses = {'total_loss': torch.tensor(0.0, device=self.device)}
-                        
-                        # Get predictions without targets (for metrics)
-                        predictions = self.head(fused_feats)  # Only pass fused_feats, not targets
-                        
-                        # Ensure targets have the correct shape for metrics update
-                        # The predictions are [B, C, H, W] and targets might be [B, 1, H, W] or [B, H, W]
-                        if targets.dim() == 4 and targets.shape[1] == 1:
-                            # Convert [B, 1, H, W] to [B, H, W]
-                            targets = targets.squeeze(1)
-                        
-                        # Handle shape mismatch - convert class indices to appropriate format for metrics
-                        # Check if we're getting a shape mismatch warning
-                        if predictions.shape[1] != targets.shape[1] if targets.dim() > 3 else predictions.shape[1] != 1:
-                            # If targets are class indices [B, H, W], pass the full predictions tensor
-                            if targets.dim() == 3:
-                                # Ensure predictions is a 4D tensor with shape [B, C, H, W]
-                                if isinstance(predictions, dict):
-                                    # If predictions is a dictionary, extract logits
-                                    pred_tensor = predictions['logits'] if 'logits' in predictions else predictions
-                                else:
-                                    # If predictions is already a tensor
-                                    pred_tensor = predictions
-                                
-                                # Verify we have a 4D tensor before passing to metrics
-                                if pred_tensor.dim() == 4:
-                                    self.val_metrics.update(pred_tensor, targets)
-                                else:
-                                    print(f"Warning: Expected 4D predictions tensor, got shape {pred_tensor.shape}")
-                            else:
-                                print(f"Warning: Incompatible target shape: {targets.shape} vs prediction shape: {predictions.shape}")
-                        else:
-                            # If shapes match (both one-hot), update directly
-                            # Ensure predictions is a 4D tensor
-                            if isinstance(predictions, dict):
-                                pred_tensor = predictions['logits'] if 'logits' in predictions else predictions
-                            else:
-                                pred_tensor = predictions
-                            
-                            if pred_tensor.dim() == 4:
-                                self.val_metrics.update(pred_tensor, targets)
-                            else:
-                                print(f"Warning: Expected 4D predictions tensor, got shape {pred_tensor.shape}")
-                        
-                        #print("  SegmentationMetrics.update completed")
-                    
-                    # Update progress tracking
-                    batch_size = images.size(0)
-                    processed_samples += batch_size
-                    running_loss += losses['total_loss'].item() * batch_size
-                    
-                    # Update progress bar (less frequently to reduce overhead)
-                    if batch_idx % 10 == 0:
-                        try:
-                            progress_bar.set_postfix({
-                                'loss': f"{losses['total_loss'].item():.4f}"
-                            })
-                        except Exception as e:
-                            # Ignore errors in progress bar updates
-                            print(f"Warning: Error updating progress bar: {str(e)}")
-                    
-                    # Visualize validation predictions 3 times per validation run
-                    if batch_idx % val_viz_interval == 0:
-                        try:
-                            # Ensure predictions is a valid tensor
-                            if isinstance(predictions, torch.Tensor) and predictions.dim() == 4:
-                                viz_name = f'val_epoch{self.epoch+1}_batch{batch_idx}'
-                                self._visualize_predictions(images.detach(), predictions.detach(), targets.detach(), prefix=viz_name)
-                                print(f"  Visualized validation batch {batch_idx}")
-                        except Exception as e:
-                            print(f"Warning: Failed to visualize validation predictions: {e}")
-                
-                except Exception as e:
-                    print(f"Error in validation batch {batch_idx}: {str(e)}")
-                    # Continue with next batch instead of crashing
-                    continue
-                
-                # Clear cache periodically to prevent memory fragmentation
-                if batch_idx % 20 == 0:
-                    torch.cuda.empty_cache()
-        
+
+                    # 5. Head - Calculate Loss (inside autocast for consistency)
+                    # Pass Long targets or let head handle conversion if needed
+                    losses = self.head(fused_feats, target_indices)
+                    if not isinstance(losses, dict) or 'total_loss' not in losses:
+                        print(f"Warning: Invalid loss dict returned by head in val batch {batch_idx}")
+                        total_loss = torch.tensor(0.0, device=self.device)
+                    else:
+                        total_loss = losses['total_loss']
+                # Get predictions for metrics
+                predictions = self.head(fused_feats) # Inference call
+
+                # --- Update Metrics & Loss ---
+                # Ensure targets passed to metrics are Long indices [B, H, W]
+                target_indices = targets
+                if target_indices.dim() == 4 and target_indices.size(1) == self.num_classes: # If it was one-hot
+                    target_indices = target_indices.argmax(dim=1)
+                elif target_indices.dim() == 4 and target_indices.size(1) == 1:
+                    target_indices = target_indices.squeeze(1)
+                # Now target_indices should be [B, H, W] Long
+
+                # Pass predictions [B, C, H, W] and targets [B, H, W] Long
+                self.val_metrics.update(predictions, target_indices)
+
+                batch_size = images.size(0)
+                running_loss += total_loss.item() * batch_size # Use .item() for accumulation
+                processed_samples += batch_size
+
+                # Update progress bar
+                if batch_idx % 10 == 0:
+                    progress_bar.set_postfix({'Loss': f"{total_loss.item():.4f}"})
+
+                # Visualize first batch only
+                if batch_idx == 0: # Visualize only on first validation epoch
+                     if hasattr(self, '_visualize_predictions') and self.class_colors is not None:
+                         try:
+                             self._visualize_predictions(images.detach(), predictions.detach(), target_indices.detach(), prefix='val')
+                         except Exception as e:
+                             print(f"Warning: Failed to visualize validation predictions: {e}")
+
+            except Exception as e:
+                print(f"Error processing validation batch {batch_idx}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue # Skip to next batch on error
+
+            # Clear cache periodically
+            if batch_idx % 50 == 0: # Less frequent cache clearing
+                 torch.cuda.empty_cache()
+
         # Skip metrics calculation if no samples were processed
         if processed_samples == 0:
             print("Warning: No samples were successfully processed during validation")
             return {'loss': float('inf'), 'mean_iou': 0.0}
-        
+
         # Compute final metrics
         metrics = self.val_metrics.get_metrics()
         avg_loss = running_loss / processed_samples
         metrics['loss'] = avg_loss
-        
+
         # Compute validation time
         val_time = time.time() - val_start_time
-        
+
         # Log validation summary
-        print(f"\nValidation Summary:")
+        print(f"\nValidation Summary (Epoch {self.epoch}):") # Use current epoch
         print(f"  Time: {val_time:.2f}s")
         print(f"  Loss: {avg_loss:.4f}")
         print(f"  Mean IoU: {metrics.get('mean_iou', 0):.4f}")
-        
+        if 'class_iou' in metrics:
+             iou_str = " | ".join([f"{iou:.3f}" for iou in metrics['class_iou']])
+             print(f"  Class IoU: [ {iou_str} ]")
+             # Optional: plot confusion matrix if available
+             # if 'confusion_matrix' in metrics: self._plot_confusion_matrix(metrics['confusion_matrix'], prefix='val')
+
+
+        # Step scheduler if ReduceLROnPlateau
+        if self.scheduler is not None and isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+             self.scheduler.step(metrics.get('mean_iou', 0.0)) # Step based on validation mIoU
+
         return metrics
     
     def _plot_metrics_history(self):
@@ -990,6 +951,49 @@ class Trainer:
         """Log metrics to console and TensorBoard"""
         # This method is no longer needed
         pass
+
+    def _plot_epoch_losses(self, current_loss):
+        """Create and save a plot of losses after each epoch."""
+        try:
+            import matplotlib.pyplot as plt
+            
+            # Record the current loss
+            if not hasattr(self, 'epoch_losses'):
+                self.epoch_losses = []
+            self.epoch_losses.append(current_loss)
+            
+            # Create the plot
+            plt.figure(figsize=(10, 5))
+            plt.plot(range(1, len(self.epoch_losses) + 1), self.epoch_losses, 'b-', marker='o')
+            plt.grid(True)
+            plt.title(f'Training Loss by Epoch')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            
+            # Annotate the latest value
+            plt.annotate(f'{current_loss:.4f}', 
+                        xy=(len(self.epoch_losses), current_loss),
+                        xytext=(0, 10),
+                        textcoords='offset points',
+                        ha='center')
+            
+            # Add per-class losses if available from last batch
+            if hasattr(self, 'head') and hasattr(self.head, 'get_debug_info'):
+                debug_info = self.head.get_debug_info()
+                if debug_info:
+                    plt.figtext(0.15, 0.02, f"Latest class statistics: {str(debug_info)}", 
+                              wrap=True, fontsize=8)
+            
+            # Save the plot
+            loss_plot_path = self.viz_dir / f'epoch_{self.epoch+1}_losses.png'
+            plt.savefig(loss_plot_path)
+            plt.close()
+            
+            print(f"  Loss plot saved to {loss_plot_path}")
+            return True
+        except Exception as e:
+            print(f"Warning: Failed to create loss plot: {e}")
+            return False
 
 
 def custom_collate_fn(batch):
@@ -1299,6 +1303,7 @@ def main():
         config, 
         train_config,
         train_loader, 
+        model_config,
         val_loader, 
         device, 
         output_dir,
