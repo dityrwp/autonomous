@@ -59,7 +59,7 @@ class BEVSegmentationHead(nn.Module):
         num_classes: int = 6,
         dropout: float = 0.1,
         use_focal_loss: bool = True,
-        focal_gamma: float = 1.5,
+        focal_gamma: float = 2.0,
         class_weights: List[float] = [0.75, 0.5, 5.0, 5.0, 2.0, 1.0],
         label_smoothing: float = 0.05,
         use_dice_loss: bool = True,
@@ -150,12 +150,10 @@ class BEVSegmentationHead(nn.Module):
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         
         # Feature extraction (with FP16)
-        with torch.cuda.amp.autocast():
-            feat = self.features(x)
-        
-        # Class prediction
-        logits = self.classifier(feat)
-        
+        feat = self.features(x.float()) # feat might be float16 if autocast is active
+
+        # 2. Classification
+        logits = self.classifier(feat.float())
         if targets is not None:
             losses = {}
             

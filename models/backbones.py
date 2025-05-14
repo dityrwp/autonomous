@@ -431,4 +431,3 @@ class SECONDBackbone(nn.Module):
             'sparse_features': sparse_features,
             'bev_features': bev_features
         }
-
