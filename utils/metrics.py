@@ -38,9 +38,6 @@ class SegmentationMetrics:
             targets: [B, C, H, W] binary ground truth or [B, H, W] class indices
             threshold: Classification threshold for predictions
         """
-        # Print shapes for debugging
-        print(f"  SegmentationMetrics.update input shapes: predictions {predictions.shape}, targets {targets.shape}")
-        
         # Handle case where targets are class indices [B, H, W] instead of one-hot [B, C, H, W]
         if targets.dim() == 3 and predictions.dim() == 4:
             # Convert predictions to class indices if they're probabilities

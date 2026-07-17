@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint  # required for the explicit checkpoint() calls below
 from typing import Dict, Tuple, List, Optional
 import math
 import matplotlib.pyplot as plt

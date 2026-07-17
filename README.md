@@ -95,14 +95,16 @@ Full architectural and training details are in the [paper](paper/paper.pdf).
 ├── models/
 │   ├── backbones.py          # EfficientNetV2-S camera backbone, SECOND LiDAR backbone
 │   ├── fusion.py              # multi-scale cross-attention fusion module
-│   └── heads.py                # segmentation head + focal/dice loss
+│   ├── heads.py               # segmentation head + focal/dice loss
+│   └── bev_model.py            # end-to-end model wrapper (used by test.py & inference.py)
 ├── scripts/
 │   ├── precompute_bev_labels.py  # rasterize nuScenes HD maps into BEV label grids (run this first)
 │   ├── train.sh / test.sh        # convenience launch scripts
 │   └── analyze_nuscenes_splits.py, check_*.py  # dataset sanity-check utilities
 ├── utils/                    # metrics (IoU/precision/recall), early stopping, logging, config loading
 ├── train.py                  # training entry point
-├── test.py                   # evaluation entry point
+├── test.py                   # evaluation entry point (dataset-wide metrics)
+├── inference.py               # single-sample inference / demo
 ├── assets/figures/            # figures used in this README, exported from the paper
 └── paper/paper.pdf            # the paper itself
 ```
@@ -163,6 +165,18 @@ bash scripts/test.sh \
     --dataroot /path/to/nuscenes \
     --bev-labels-dir /path/to/bev_labels \
     --split val
+```
+
+**4. Run inference on a single sample** (quick demo / checkpoint smoke test — no full dataset needed, just one image + one LiDAR `.bin`):
+
+```bash
+python inference.py \
+    --model-config configs/model.yaml \
+    --checkpoint outputs/checkpoints/best_model.pth \
+    --image sample.jpg \
+    --lidar sample.bin \
+    --output prediction.png \
+    --side-by-side
 ```
 
 All hyperparameters (learning rates per component, loss weights, augmentation, scheduler) live in [`configs/model.yaml`](configs/model.yaml) and [`configs/train.yaml`](configs/train.yaml).
