@@ -2,7 +2,7 @@
 
 # Basic Training Settings
 train:
-  epochs: 54 # Return to original value for proper convergence
+  epochs: 138 # Total epochs for the reported run (best checkpoint selected by early stopping at epoch 134)
   batch_size: 4  # Increase batch size if memory allows
   num_workers: 8  # Keep the increased worker count
   pin_memory: true
@@ -43,7 +43,7 @@ optimizer:
 # Learning Rate Scheduler
 scheduler:
   name: "CosineAnnealingLR"
-  T_max: 50  # Match with epochs
+  T_max: 138  # Match with epochs
   eta_min: 1.0e-6
   warmup_epochs: 3  # Reduced for shorter training
   warmup_ratio: 0.1
@@ -80,8 +80,10 @@ checkpoint:
   save_interval: 2  # Save every 5 epochs
   save_best: true
   save_last: true
-  resume: true  # Changed to false since we're starting fresh training with new data
-  resume_path: "outputs/checkpoints/checkpoint_epoch_50.pth"
+  # Note: train.py only checks `resume_path` (if set and the file exists); this
+  # `resume` flag itself is not read anywhere in the training loop.
+  resume: false
+  resume_path: ""  # e.g. "outputs/checkpoints/checkpoint_epoch_50.pth" to continue a prior run
 
 # Logging
 logging:
