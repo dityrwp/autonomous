@@ -5,12 +5,17 @@ numpy==1.22.4
 PyYAML==6.0.2
 tensorboard==2.6.0
 
+# Sparse convolutions for the SECOND LiDAR backbone (must match the torch/CUDA build above)
+spconv-cu118==2.3.6
+
 # nuScenes dataset
 nuscenes-devkit==1.1.11
 pyquaternion==0.9.9
 shapely==1.8.5.post1
+descartes==1.1.0
 scikit-image==0.18.3
 opencv-python==4.5.5.64
+Pillow==9.5.0
 
 # Utilities and logging
 tqdm==4.65.2

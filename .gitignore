@@ -1,1 +1,32 @@
-env_bev
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Data / datasets (never commit raw or precomputed data)
+data/
+nuscenes*/
+bev_labels/
+
+# Training artifacts
+outputs/
+checkpoints/
+predictions/
+visualizations/
+logs/
+*.pth
+*.pt
+*.ckpt
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Env
+env_bev/
+.env
+venv/
+.venv/

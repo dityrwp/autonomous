@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below. This entry will be updated with the official venue/DOI once the paper is published."
+title: "Bird's-Eye View Semantic Segmentation for Autonomous Driving via Limited Multi-Modal Sensor Fusion"
+authors:
+  - family-names: Baskoro
+    given-names: "Muhammad Aditya R."
+    affiliation: "Universitas Gadjah Mada"
+  - family-names: Wahono
+    given-names: Bambang
+    affiliation: "Research Centre for Smart Mechatronics, BRIN"
+  - family-names: Furqon
+    given-names: Maulana
+    affiliation: "Research Centre for Smart Mechatronics, BRIN"
+  - family-names: Salim
+    given-names: "Taufik Ibnu"
+    affiliation: "Research Centre for Smart Mechatronics, BRIN"
+  - family-names: Praptijanto
+    given-names: Achmad
+    affiliation: "Research Centre for Smart Mechatronics, BRIN"
+  - family-names: Tjolleng
+    given-names: Amir
+    affiliation: "Bina Nusantara University"
+  - family-names: Ali
+    given-names: "Husni Rois"
+    affiliation: "Universitas Gadjah Mada"
+  - family-names: Pramana
+    given-names: "Rakhmad Indra"
+    affiliation: "Research Centre for Smart Mechatronics, BRIN"
+date-released: 2026-07-18
+url: "https://github.com/dityrwp/autonomous"
+license: MIT
